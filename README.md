@@ -11,15 +11,31 @@ put to the policy first and comes back **allow / ask / deny**.
 
 ```bash
 git clone https://github.com/marju212/miniagent && cd miniagent
-
-./miniagent --install            # symlink onto PATH, create the settings file
-$EDITOR "$(miniagent --env)"     # put your MiniMax API key in
-miniagent --init-policy          # optional: a global rule file you can edit
+./miniagent --install
 ```
 
-`--install` links the wrapper into `~/.local/bin` and offers to put that on your
-`PATH` if it is not there already. Nothing stops you calling `python3 agent.py`
-directly instead — the wrapper only loads your settings first.
+```
+linked  ~/.local/bin/miniagent -> ~/code/miniagent/miniagent
+
+settings -> ~/.miniagent/env
+  press enter to take the default
+  endpoint [https://api.minimax.io/v1]: ▏
+  model [MiniMax-M2.5]:
+  api key (hidden; enter to fill in later):
+wrote   ~/.miniagent/env
+ready   ~/.local/bin is on your PATH
+```
+
+`--install` links the wrapper into `~/.local/bin`, asks for the three settings
+it needs, and offers to put that directory on your `PATH` if it is not there
+already. Anything already exported is taken as the default, the key is not
+echoed, and skipping it leaves the file ready to fill in later. With no
+terminal — a script, a pipe — it writes the defaults instead of asking.
+
+`miniagent --init-policy` then writes a global rule file you can edit, if you
+want to start from something other than the built-in defaults. Nothing stops
+you calling `python3 agent.py` directly either; the wrapper only loads your
+settings first.
 
 ## Use
 
@@ -91,8 +107,9 @@ Ollama, OpenRouter, OpenAI.
 
 ## Settings
 
-Your exports go in `~/.miniagent/env`. The wrapper sources it as shell, so a key
-out of a password manager works:
+`--install` and `--init` write `~/.miniagent/env` for you. The wrapper sources
+it as shell, so you can go back and change a value to anything, including a key
+out of a password manager:
 
 ```bash
 export AGENT_API_KEY=$(pass show minimax/api)
@@ -110,7 +127,7 @@ AGENT_MODEL=MiniMax-M2.5-highspeed miniagent ~/code/proj
 | | |
 |---|---|
 | `miniagent --install [bindir]` | symlink onto PATH, seed the settings file |
-| `miniagent --init` | create the settings file from the template |
+| `miniagent --init` | ask for endpoint, model and key, and save them |
 | `miniagent --env` | print its path |
 | `MINIAGENT_ENV` | use a different settings file |
 | `MINIAGENT_PYTHON` | use a different interpreter |

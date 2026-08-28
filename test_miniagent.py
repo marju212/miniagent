@@ -1056,6 +1056,131 @@ def run_wrapper(*args, home, env=None):
     return subprocess.run([str(WRAPPER), *args], capture_output=True, text=True, env=e)
 
 
+@unittest.skipUnless(WRAPPER.is_file() and shutil.which("bash") and hasattr(pty, "openpty"),
+                     "needs bash and a pty")
+class InteractiveSetup(unittest.TestCase):
+    """`--init` and `--install` ask for the endpoint, model and key. read -p and
+    read -s only behave on a terminal, so drive them through a pty."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp()).resolve()
+        self.bindir = Path(tempfile.mkdtemp()).resolve()
+
+    @property
+    def env_file(self) -> Path:
+        return self.home / ".miniagent" / "env"
+
+    def exports(self) -> dict:
+        """What the file is worth to a shell - the wrapper sources it, so a
+        parser that just strips quotes would judge the escaping wrongly."""
+        names = ("AGENT_BASE_URL", "AGENT_MODEL", "AGENT_API_KEY")
+        script = (f'. "{self.env_file}"; '
+                  'for v in ' + " ".join(names) + '; do printf "%s=%s\\0" "$v" "${!v-}"; done')
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = {}
+        for item in r.stdout.split("\0"):
+            if "=" in item:
+                key, _, val = item.partition("=")
+                got[key] = val
+        return got
+
+    def run_tty(self, args, answers, env=None):
+        master, slave = pty.openpty()
+        e = {"PATH": f"{self.bindir}:{os.environ['PATH']}", "HOME": str(self.home),
+             "TERM": "xterm", "SHELL": "/bin/bash"}
+        e.update(env or {})
+        proc = subprocess.Popen([str(WRAPPER), *args], stdin=slave, stdout=slave,
+                                stderr=slave, env=e)
+        os.close(slave)
+        buf = ""
+
+        def pump(seconds=1.2):
+            nonlocal buf
+            end = time.time() + seconds
+            while time.time() < end:
+                try:
+                    if select.select([master], [], [], 0.1)[0]:
+                        chunk = os.read(master, 8192)
+                        if not chunk:
+                            return
+                        buf += chunk.decode("utf-8", "replace")
+                except OSError:
+                    return
+
+        try:
+            pump(1.5)
+            for answer in answers:
+                try:
+                    os.write(master, answer)
+                except OSError:
+                    break
+                pump()
+            proc.wait(timeout=15)
+        finally:
+            proc.kill()
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        return buf.replace("\r\n", "\n")
+
+    def test_init_asks_for_the_three_settings_and_saves_them(self):
+        out = self.run_tty(["--init"],
+                           [b"\r",                            # take the default
+                            b"MiniMax-M2.5-highspeed\r",
+                            b"sk-super-secret-123\r"])
+        self.assertIn("endpoint [https://api.minimax.io/v1]", out)
+        got = self.exports()
+        self.assertEqual(got["AGENT_BASE_URL"], "https://api.minimax.io/v1")
+        self.assertEqual(got["AGENT_MODEL"], "MiniMax-M2.5-highspeed")
+        self.assertEqual(got["AGENT_API_KEY"], "sk-super-secret-123")
+        self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
+
+    def test_the_key_is_never_echoed(self):
+        out = self.run_tty(["--init"], [b"\r", b"\r", b"sk-super-secret-123\r"])
+        self.assertNotIn("sk-super-secret-123", out)
+
+    def test_install_asks_when_there_is_nothing_to_go_on(self):
+        out = self.run_tty(["--install", str(self.bindir)],
+                           [b"https://openrouter.ai/api/v1\r",
+                            b"minimax/minimax-m2.5\r", b"sk-or-1\r"])
+        self.assertIn("linked", out)
+        self.assertEqual(self.exports()["AGENT_BASE_URL"], "https://openrouter.ai/api/v1")
+        self.assertTrue((self.bindir / "miniagent").is_symlink())
+
+    def test_a_settings_file_without_a_key_is_offered_the_prompts(self):
+        self.env_file.parent.mkdir(parents=True)
+        self.env_file.write_text("export AGENT_API_KEY=\n", encoding="utf-8")
+        out = self.run_tty(["--install", str(self.bindir)], [b"\r", b"\r", b"sk-late\r"])
+        self.assertIn("no API key", out)
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-late")
+
+    def test_a_key_already_in_the_environment_is_taken_and_masked(self):
+        out = self.run_tty(["--init"], [b"\r", b"\r"],
+                           env={"AGENT_API_KEY": "sk-abcdefgh12345678"})
+        self.assertIn("sk-a...5678", out)
+        self.assertNotIn("sk-abcdefgh12345678", out)
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-abcdefgh12345678")
+
+    def test_a_key_with_a_quote_in_it_survives_the_round_trip(self):
+        # the file is sourced as shell, so an unescaped quote would break it
+        self.run_tty(["--init"], [b"\r", b"\r", b"sk-it's-fine\r"])
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-it's-fine")
+
+    def test_a_key_that_looks_like_shell_is_not_run(self):
+        self.run_tty(["--init"], [b"\r", b"\r", b"sk-$(id -u)-`whoami`\r"])
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-$(id -u)-`whoami`")
+
+    def test_without_a_terminal_it_writes_defaults_instead_of_asking(self):
+        r = subprocess.run([str(WRAPPER), "--init"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL,
+                           env={"PATH": os.environ["PATH"], "HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.exports()["AGENT_MODEL"], "MiniMax-M2.5")
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "")
+
+
 @unittest.skipUnless(WRAPPER.is_file() and shutil.which("bash"), "needs bash")
 class Wrapper(unittest.TestCase):
     def setUp(self):

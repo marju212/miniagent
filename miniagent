@@ -42,9 +42,9 @@ usage() {
 usage: miniagent [wrapper option] | [agent option] [directory]
 
 wrapper options
-  --install [bindir]   symlink onto your PATH (default ~/.local/bin) and
-                       create the settings file if it is missing
-  --init               create ~/.miniagent/env from the template
+  --install [bindir]   symlink onto your PATH (default ~/.local/bin), then
+                       ask for endpoint, model and key if they are not set yet
+  --init               ask for endpoint, model and key, and save them
   --env                print the path of the settings file
                        (edit it with: $EDITOR "$(miniagent --env)")
 
@@ -53,16 +53,56 @@ EOF
 }
 
 
-write_env_template() {
+interactive() { [ -t 0 ] && [ -t 1 ]; }
+
+
+shq() {                                 # a value the settings file can hold verbatim
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
+}
+
+
+mask() {
+    if [ ${#1} -le 8 ]; then printf '****'; else printf '%s...%s' "${1:0:4}" "${1: -4}"; fi
+}
+
+
+ask() {                                 # ask PROMPT DEFAULT; -p writes to stderr,
+    local answer                        # so only the answer is captured
+    if [ -n "$2" ]; then
+        read -r -p "  $1 [$2]: " answer
+        printf '%s' "${answer:-$2}"
+    else
+        read -r -p "  $1: " answer
+        printf '%s' "$answer"
+    fi
+}
+
+
+ask_secret() {
+    local answer
+    read -rs -p "  $1: " answer
+    printf '\n' >&2
+    printf '%s' "$answer"
+}
+
+
+write_env_file() {                      # write_env_file URL MODEL KEY
     mkdir -p "$(dirname "$ENV_FILE")"
-    ( umask 077; cat > "$ENV_FILE" <<'EOF'
+    (
+        umask 077
+        {
+            cat <<'EOF'
 # miniagent settings.  Sourced by the `miniagent` wrapper as shell, so command
 # substitution works.  Anything already set in your shell wins over what is
 # here.  Keep it private - it holds your API key.
 
-export AGENT_API_KEY=                            # MiniMax key (or MINIMAX_API_KEY)
-export AGENT_MODEL=MiniMax-M2.5                  # or MiniMax-M2.5-highspeed
-export AGENT_BASE_URL=https://api.minimax.io/v1  # or any /v1/chat/completions server
+EOF
+            printf 'export AGENT_BASE_URL=%s\n' "$(shq "$1")"
+            printf 'export AGENT_MODEL=%s\n'    "$(shq "$2")"
+            printf 'export AGENT_API_KEY=%s\n'  "$(shq "$3")"
+            cat <<'EOF'
 
 # A key out of a password manager works too:
 # export AGENT_API_KEY=$(pass show minimax/api)
@@ -78,8 +118,45 @@ export AGENT_BASE_URL=https://api.minimax.io/v1  # or any /v1/chat/completions s
 # export AGENT_YOLO=1         # auto-approve every `ask` (a `deny` still holds)
 # export AGENT_POLICY=        # an extra rule file for every run
 EOF
+        } > "$ENV_FILE"
     )
     chmod 600 "$ENV_FILE"
+}
+
+
+setup_env() {
+    local url model key
+    if ! interactive; then              # a pipe or a script: leave it to be edited
+        write_env_file "${AGENT_BASE_URL:-https://api.minimax.io/v1}" \
+                       "${AGENT_MODEL:-MiniMax-M2.5}" \
+                       "${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}"
+        return
+    fi
+
+    printf '\nsettings -> %s\n' "$ENV_FILE" >&2
+    printf '  press enter to take the default\n' >&2
+    url=$(ask "endpoint" "${AGENT_BASE_URL:-https://api.minimax.io/v1}")
+    model=$(ask "model" "${AGENT_MODEL:-MiniMax-M2.5}")
+
+    key=${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}
+    if [ -n "$key" ]; then
+        printf '  api key: taking the one already in your environment (%s)\n' \
+               "$(mask "$key")" >&2
+    else
+        key=$(ask_secret "api key (hidden; enter to fill in later)")
+    fi
+
+    write_env_file "$url" "$model" "$key"
+    [ -n "$key" ] || printf '\nno key yet. Put one in with: %s\n' \
+                            "\$EDITOR \"\$(miniagent --env)\"" >&2
+}
+
+
+# The key can be missing even when the file is there - the old template wrote an
+# empty one, and you can skip it above.
+env_has_key() {
+    [ -f "$ENV_FILE" ] || return 1
+    ( set +u; . "$ENV_FILE" >/dev/null 2>&1; [ -n "${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}" ] )
 }
 
 
@@ -106,11 +183,18 @@ install_self() {
     ln -sfn "$SELF" "$link"
     printf 'linked  %s -> %s\n' "$link" "$SELF"
 
-    if [ -f "$ENV_FILE" ]; then
+    if [ ! -f "$ENV_FILE" ]; then
+        setup_env
+        printf 'wrote   %s\n' "$ENV_FILE"
+    elif env_has_key; then
         printf 'kept    %s\n' "$ENV_FILE"
     else
-        write_env_template
-        printf 'wrote   %s   <- put your API key here\n' "$ENV_FILE"
+        printf 'found   %s, but it has no API key\n' "$ENV_FILE"
+        if interactive; then
+            setup_env
+        else
+            printf '        put one in with: $EDITOR "$(miniagent --env)"\n'
+        fi
     fi
 
     case ":$PATH:" in
@@ -138,7 +222,7 @@ install_self() {
 case ${1:-} in
     --install)  shift; install_self "${1:-}"; exit 0 ;;
     --init)     [ -f "$ENV_FILE" ] && die "$ENV_FILE already exists; edit it instead"
-                write_env_template; printf 'wrote %s\n' "$ENV_FILE"; exit 0 ;;
+                setup_env; printf 'wrote %s\n' "$ENV_FILE"; exit 0 ;;
     --env)      printf '%s\n' "$ENV_FILE"; exit 0 ;;
     -h|--help)  usage; echo; exec "$PYTHON" "$HERE/agent.py" --help ;;
 esac
