@@ -340,6 +340,7 @@ class StatusBar:
 
     def __init__(self):
         self.on = False
+        self.stale = False
         self.text = ""
 
     def install(self) -> bool:
@@ -365,11 +366,11 @@ class StatusBar:
         return True
 
     def _resized(self, *_a) -> None:
-        if not self.on:
-            return
-        rows = shutil.get_terminal_size().lines
-        sys.stdout.write(f"\0337\033[1;{max(1, rows - 1)}r\0338")
-        self.draw()
+        # Only a flag: writing to stdout from a signal handler can re-enter a
+        # half-finished write and raise, and DECSC has one save slot per
+        # terminal, so a save here would clobber an outer draw's. The region is
+        # re-cut at the next draw instead.
+        self.stale = True
 
     def draw(self, text: str = None) -> None:
         if text is not None:
@@ -377,10 +378,18 @@ class StatusBar:
         if not self.on:
             return
         size = shutil.get_terminal_size()
+        if self.stale:                       # the terminal was resized
+            self.stale = False
+            if size.lines < 3:
+                self.remove()
+                return
+            sys.stdout.write(f"\0337\033[1;{size.lines - 1}r\0338")
         # not _short(): it collapses runs of spaces, and the gaps between the
         # fields are what makes the bar readable
         room = max(1, size.columns - 2)
-        line = self.text if len(self.text) <= room else self.text[:room - 3] + "..."
+        line = self.text
+        if len(line) > room:
+            line = (line[:max(0, room - 3)] + "...")[:room]
         sys.stdout.write(f"\0337\033[{size.lines};1H\033[2K"
                          f"\033[90m {line}\033[0m\0338")
         sys.stdout.flush()
@@ -405,9 +414,14 @@ def shell_escape(line: str) -> str:
     if not cmd:
         BAR.remove()
         try:
-            subprocess.run([os.environ.get("SHELL") or "/bin/bash"], cwd=ROOTS[0])
+            subprocess.run([os.environ.get("SHELL") or "/bin/bash"],
+                           cwd=ROOTS[0], env=bash_env())
         except OSError as e:
             warn(str(e))
+        except KeyboardInterrupt:
+            # The shell shares our process group, so ctrl-c in there reaches us
+            # too. It is meant for whatever the shell is running, not for us.
+            print()
         finally:
             BAR.install()
         return ""
@@ -421,18 +435,26 @@ def shell_escape(line: str) -> str:
         return ""
     out = []
     try:
-        for chunk in p.stdout:      # echoed as it arrives, and kept
-            sys.stdout.write(chunk)
-            out.append(chunk)
-        code = p.wait()
-    except KeyboardInterrupt:
-        p.kill()
-        code = -1
-        print(yellow("  [interrupted]"))
+        try:
+            for chunk in p.stdout:  # echoed as it arrives, and kept
+                sys.stdout.write(chunk)
+                out.append(chunk)
+            code = p.wait()
+        except KeyboardInterrupt:
+            p.kill()
+            code = -1
+            print(yellow("  [interrupted]"))
+    finally:
+        p.stdout.close()
+        p.wait()                    # reap it rather than leave a zombie behind
     body = "".join(out).strip()
     if code:
         body += f"\n(exit {code})"
-    return f"$ {cmd}\n{body}".strip()
+    # Clipped like a tool result: this is spliced into your next message, and
+    # `!cat package-lock.json` would otherwise sit in the transcript for good -
+    # compact() can only shrink tool results, never a user message.
+    return _clip(f"$ {cmd}\n{body}".strip(),
+                 int(LIMITS.get("max_output_chars", 20_000)))
 
 
 def prompt_text(text: str) -> str:
@@ -1010,7 +1032,7 @@ def show_rules(pol) -> None:
     print(f"{bold('writable roots')}: {roots}")
 
 
-def slash(pol, cmd: str, messages: list, system: str) -> bool:
+def slash(pol, cmd: str, messages: list, system: str, mine: list) -> bool:
     """Returns False to quit."""
     global SHOW_THINKING
     word, _, rest = cmd[1:].partition(" ")
@@ -1046,6 +1068,7 @@ def slash(pol, cmd: str, messages: list, system: str) -> bool:
     elif word == "reset":
         del messages[1:]
         messages[0] = {"role": "system", "content": system}
+        mine.clear()          # including anything `!` produced but never sent
         print("  conversation cleared")
     else:
         print(f"  unknown command {cmd!r}; try /help")
@@ -1176,7 +1199,7 @@ def main() -> None:
                 mine.append(got)
             continue
         if user.startswith("/"):
-            if not slash(pol, user, messages, system):
+            if not slash(pol, user, messages, system, mine):
                 BAR.remove()
                 print(dim(f"{USAGE}"))
                 return

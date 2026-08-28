@@ -713,6 +713,77 @@ class ShellEscape(unittest.TestCase):
         self.assertEqual(calls[0][1]["cwd"], self.root)
 
 
+class ShellEscapeMishaps(unittest.TestCase):
+    """The cases a code review found: they all ended the session or the
+    transcript in a state you could not recover from."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        agent.ROOTS[:] = [self.root]
+        self._run, self._popen = agent.subprocess.run, agent.subprocess.Popen
+
+    def tearDown(self):
+        agent.subprocess.run, agent.subprocess.Popen = self._run, self._popen
+
+    def test_ctrl_c_in_the_bare_shell_does_not_end_the_session(self):
+        # the sub-shell shares our process group, so ctrl-c meant for whatever
+        # it is running arrives here too
+        def interrupted(*_a, **_k):
+            raise KeyboardInterrupt
+
+        agent.subprocess.run = interrupted
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agent.shell_escape("!"), "")
+
+    def test_an_interrupted_command_is_reaped_and_its_pipe_closed(self):
+        state = {"killed": 0, "waited": 0, "closed": False}
+
+        class Pipe:
+            def __iter__(self):
+                raise KeyboardInterrupt
+
+            def close(self):
+                state["closed"] = True
+
+        class Child:
+            stdout = Pipe()
+
+            def kill(self):
+                state["killed"] += 1
+
+            def wait(self):
+                state["waited"] += 1
+                return 0
+
+        agent.subprocess.Popen = lambda *a, **k: Child()
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.shell_escape("!sleep 60")
+        self.assertEqual(state["killed"], 1)
+        self.assertTrue(state["closed"])
+        self.assertGreaterEqual(state["waited"], 1)
+
+    def test_the_output_is_clipped_like_a_tool_result(self):
+        # it is spliced into your next message, and compact() can only ever
+        # shrink tool results - a huge one would sit in the transcript for good
+        agent.LIMITS["max_output_chars"] = 500
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = agent.shell_escape("!head -c 20000 /dev/zero | tr '\\0' x")
+        finally:
+            agent.LIMITS["max_output_chars"] = \
+                policy.DEFAULTS["limits"]["max_output_chars"]
+        self.assertLessEqual(len(got), 600)
+        self.assertIn("cut from the middle", got)
+
+    def test_reset_forgets_what_bang_produced_too(self):
+        mine = ["$ git diff\n...lots of diff..."]
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "x"}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.slash(make_policy(), "/reset", msgs, "s", mine)
+        self.assertEqual(mine, [], "/reset said it forgot the conversation")
+        self.assertEqual(len(msgs), 1)
+
+
 class Bar(unittest.TestCase):
     def setUp(self):
         self.bar = agent.StatusBar()
@@ -776,6 +847,39 @@ class Bar(unittest.TestCase):
         drawn = re.findall(r"\033\[2K\033\[90m (.*?)\033\[0m", out.getvalue())[-1]
         self.assertLessEqual(len(drawn), cols - 2)
         self.assertTrue(drawn.endswith("..."), drawn[-20:])
+
+    def test_a_resize_only_sets_a_flag_and_the_next_draw_recuts_the_region(self):
+        # writing escape sequences from a signal handler can re-enter a
+        # half-finished stdout write, and DECSC has one save slot per terminal
+        agent._TTY = True
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.bar.install()
+            before = out.getvalue()
+            self.bar._resized()
+            self.assertEqual(out.getvalue(), before, "the handler wrote to stdout")
+            self.assertTrue(self.bar.stale)
+            self.bar.draw("x")
+            rows = shutil.get_terminal_size().lines
+            self.assertIn(f"\033[1;{rows - 1}r", out.getvalue()[len(before):])
+            self.bar.remove()
+        self.assertFalse(self.bar.stale)
+
+    def test_a_terminal_too_narrow_to_truncate_into_is_still_respected(self):
+        agent._TTY = True
+        saved = os.environ.get("COLUMNS")
+        os.environ["COLUMNS"] = "4"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.bar.install()
+                self.bar.draw("~/some/very/long/path  feature/login*")
+                self.bar.remove()
+        finally:
+            if saved is None:
+                os.environ.pop("COLUMNS", None)
+            else:
+                os.environ["COLUMNS"] = saved
+        drawn = re.findall(r"\033\[2K\033\[90m (.*?)\033\[0m", out.getvalue())[-1]
+        self.assertLessEqual(len(drawn), 2, drawn)
 
     def test_drawing_before_install_is_harmless(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
