@@ -29,9 +29,17 @@ miniagent -p "fix the failing test" ~/code/my-project  # one shot, then exit
 miniagent                                              # the current directory
 ```
 
-Type your task at the `>` prompt. The agent reads, edits and runs commands to
-do it, asking you before anything the rules do not already cover. `/help` lists
-the commands, `ctrl-c` leaves.
+```
+~/code/shop  feature/login*
+agent> anything to do?
+```
+
+Type your task at the `agent>` prompt. The line above it is refreshed every
+time: where the agent is working, the branch, and a `*` if the tree is dirty —
+which can all change under you when the agent runs `git checkout`. The agent
+reads, edits and runs commands to do the task, asking you before anything the
+rules do not already cover. `/help` lists the commands, `ctrl-c` leaves.
+`AGENT_PROMPT` renames the prompt.
 
 The prompt has full line editing: **up arrow** walks back through what you have
 asked before, **ctrl-r** searches it, and the history carries over between
@@ -222,6 +230,8 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_MAX_STEPS` | policy `max_steps`; may only lower it |
 | `AGENT_POLICY` | an extra rule file for one run |
 | `AGENT_THINKING` / `AGENT_YOLO` | off |
+| `AGENT_PROMPT` | `agent> ` |
+| `AGENT_HISTORY` | `1000` lines kept |
 
 ## Tests
 

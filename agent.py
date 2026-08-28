@@ -80,6 +80,7 @@ AUTO_APPROVE = os.environ.get("AGENT_YOLO") == "1"
 MINIMAX = "minimax" in (MODEL + BASE_URL).lower()
 GLOBAL_POLICY = Path.home() / ".miniagent" / "policy.json"
 HISTORY = Path.home() / ".miniagent" / "history"
+PROMPT = _env("AGENT_PROMPT", "agent> ")
 RETRY_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 # Request fields not every OpenAI-compatible server understands.  If one is
@@ -258,6 +259,59 @@ def suggest_rule(tool: str, subject: str) -> str:
             take = 2 if len(words) > 1 and not words[1].startswith("-") else 1
             return f"bash({pol_mod.escape_glob(' '.join(words[:take]))}*)"
     return f"{tool}({pol_mod.escape_glob(subject)})"
+
+
+def tilde(p: Path) -> str:
+    home = str(Path.home())
+    text = str(p)
+    return "~" + text[len(home):] if text == home or text.startswith(home + os.sep) else text
+
+
+def git_branch(root: Path) -> str:
+    """The branch, read out of .git rather than shelled out - this runs before
+    every prompt, and `git` is the slow way to answer it."""
+    for d in (root, *root.parents):
+        dot = d / ".git"
+        if dot.is_dir():
+            head = dot / "HEAD"
+            break
+        if dot.is_file():           # a worktree: .git points at the real one
+            try:
+                line = dot.read_text(encoding="utf-8").strip()
+            except OSError:
+                return ""
+            if not line.startswith("gitdir:"):
+                return ""
+            head = Path(line[len("gitdir:"):].strip()) / "HEAD"
+            break
+    else:
+        return ""
+    try:
+        text = head.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if text.startswith("ref: refs/heads/"):
+        return text[len("ref: refs/heads/"):]
+    return text[:8]                 # detached, so name the commit
+
+
+def git_dirty(root: Path) -> bool:
+    try:
+        r = subprocess.run(["git", "status", "--porcelain"], cwd=root,
+                           capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return False               # no git, or a repo too big to answer quickly
+    return bool(r.stdout.strip())
+
+
+def status_line(root: Path) -> str:
+    """Where the agent is working, refreshed each prompt - it can change branch
+    under you."""
+    parts = [tilde(root)]
+    branch = git_branch(root)
+    if branch:
+        parts.append(branch + ("*" if git_dirty(root) else ""))
+    return "  ".join(parts)
 
 
 def prompt_text(text: str) -> str:
@@ -962,7 +1016,7 @@ def main() -> None:
     messages = [{"role": "system", "content": system}]
 
     load_history()
-    print(bold(f"miniagent  {root}"))
+    print(bold(f"miniagent  {tilde(root)}"))
     print(dim(f"  model {MODEL} @ {BASE_URL}"))
     print(dim(f"  rules {', '.join(pol.sources)}"))
     notes = notes_files(root)
@@ -979,7 +1033,8 @@ def main() -> None:
     while True:
         try:
             print()
-            user = input(prompt_text("> ")).strip()
+            print(dim(status_line(root)))
+            user = input(prompt_text(PROMPT)).strip()
             drop_repeat()
         except (EOFError, KeyboardInterrupt):
             print(dim(f"\n{USAGE}"))

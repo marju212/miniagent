@@ -639,6 +639,65 @@ class StoppedTurn(unittest.TestCase):
         self.assertEqual(len(msgs), 2)
 
 
+# ---------------------------------------------------------------- prompt
+class StatusLine(unittest.TestCase):
+    def repo(self, *cmds) -> Path:
+        root = Path(tempfile.mkdtemp()).resolve()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True,
+                       capture_output=True)
+        for cmd in cmds:
+            subprocess.run(cmd, cwd=root, check=True, capture_output=True)
+        return root
+
+    def test_it_names_the_branch(self):
+        root = self.repo()
+        self.assertEqual(agent.git_branch(root), "main")
+        self.assertIn("main", agent.status_line(root))
+
+    def test_it_reads_a_branch_from_a_subdirectory(self):
+        root = self.repo()
+        (root / "src" / "deep").mkdir(parents=True)
+        self.assertEqual(agent.git_branch(root / "src" / "deep"), "main")
+
+    def test_a_detached_head_names_the_commit(self):
+        root = self.repo()
+        (root / "f").write_text("x", encoding="utf-8")
+        for cmd in (["git", "add", "f"],
+                    ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                     "commit", "-qm", "one"]):
+            subprocess.run(cmd, cwd=root, check=True, capture_output=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                             capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "checkout", "-q", "--detach", sha], cwd=root,
+                       check=True, capture_output=True)
+        self.assertEqual(agent.git_branch(root), sha[:8])
+
+    def test_a_worktree_git_file_is_followed(self):
+        root = self.repo()
+        fake = Path(tempfile.mkdtemp()).resolve()
+        (fake / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
+        shutil.rmtree(root / ".git")
+        (root / ".git").write_text(f"gitdir: {fake}\n", encoding="utf-8")
+        self.assertEqual(agent.git_branch(root), "feature")
+
+    def test_somewhere_without_git_says_nothing_about_branches(self):
+        plain = Path(tempfile.mkdtemp()).resolve()
+        self.assertEqual(agent.git_branch(plain), "")
+        self.assertEqual(agent.status_line(plain), str(plain))
+
+    def test_uncommitted_work_is_marked(self):
+        root = self.repo()
+        self.assertNotIn("*", agent.status_line(root))
+        (root / "new.txt").write_text("x", encoding="utf-8")
+        self.assertIn("main*", agent.status_line(root))
+
+    def test_a_path_under_home_is_shortened(self):
+        home = Path(os.environ["HOME"])
+        self.assertEqual(agent.tilde(home / "code" / "x"), "~/code/x")
+        self.assertEqual(agent.tilde(home), "~")
+        self.assertEqual(agent.tilde(Path("/opt/x")), "/opt/x")
+
+
 # ---------------------------------------------------------------- history
 @unittest.skipUnless(agent.readline is not None, "needs readline")
 class History(unittest.TestCase):
@@ -717,7 +776,8 @@ class ArrowKeys(unittest.TestCase):
                                 stdin=slave, stdout=slave, stderr=slave, env=env)
         os.close(slave)
         try:
-            self.assertTrue(self.read_until(master, r"> "), self.buf)
+            self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+            self.assertIn(proj, self.buf)          # the status line above it
             os.write(master, b"say hi\r")
             self.assertTrue(self.read_until(master, r"done"), self.buf)
             time.sleep(0.4)
