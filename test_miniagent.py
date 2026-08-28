@@ -223,6 +223,16 @@ class Layers(unittest.TestCase):
         pol = policy.load(self.root)
         self.assertNotIn("bash(rm *)", pol.data["allow"])
 
+    def test_a_bad_rule_names_the_file_it_came_from(self):
+        for doc in ({"deny": ["bash(" + "*" * (policy.MAX_PATTERN + 1) + ")"]},
+                    {"deny": "bash(rm *)"},          # a string, not a list
+                    {"ask": ["bash(ls*)", 42]},      # not a rule at all
+                    {"allow": ["bash(unclosed"]}):
+            self.write(doc)
+            with self.assertRaises(SystemExit, msg=str(doc)) as e:
+                policy.load(self.root)
+            self.assertIn(str(self.file), str(e.exception), str(doc))
+
     def test_a_broken_policy_file_names_itself(self):
         self.file.write_text("{not json", encoding="utf-8")
         with self.assertRaises(SystemExit) as e:
@@ -275,12 +285,17 @@ class Sandbox(unittest.TestCase):
         finally:
             agent.LIMITS["max_write_bytes"] = policy.DEFAULTS["limits"]["max_write_bytes"]
 
-    def test_bash_timeout_is_capped_by_the_policy(self):
+    def test_bash_timeout_is_capped_and_keeps_what_was_printed(self):
         agent.LIMITS["bash_timeout_max"] = 1
         try:
-            self.assertIn("timed out after 1s", agent.t_bash("sleep 5", timeout=300))
+            out = agent.t_bash("echo partial; sleep 5", timeout=300)
         finally:
             agent.LIMITS["bash_timeout_max"] = policy.DEFAULTS["limits"]["bash_timeout_max"]
+        self.assertIn("timed out after 1s", out)
+        # TimeoutExpired hands back raw bytes even under text=True, so this
+        # would read `b'partial\n'` if it were passed through undecoded
+        self.assertIn("partial", out)
+        self.assertNotIn("b'partial", out)
 
     def test_edit_needs_a_unique_match(self):
         (self.root / "f.txt").write_text("a\na\n")

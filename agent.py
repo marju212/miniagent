@@ -185,9 +185,11 @@ def t_bash(cmd: str, timeout: int = 120) -> str:
             text=True, errors="replace", timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
-        # `text=True` does not reach here: what was read before the timeout is
-        # handed over as raw bytes, so decode it ourselves.
-        got = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode("utf-8", "replace")
+        # Whatever was read before the timeout comes back as raw bytes even
+        # under `text=True`, and is None if nothing was read at all.
+        got = e.stdout or b""
+        if isinstance(got, bytes):
+            got = got.decode("utf-8", "replace")
         return f"ERROR: timed out after {timeout}s\n--- partial stdout ---\n{got}"
     return f"exit={r.returncode}\n--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
 

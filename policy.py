@@ -318,7 +318,11 @@ class Policy:
         self._compiled = {}
         for action in ACTIONS:
             entries = []
-            for r in data.get(action, []):
+            rules = data.get(action) or []
+            if not isinstance(rules, list):
+                raise SystemExit(f"policy: {action} must be a list of rules, "
+                                 f"not {type(rules).__name__}")
+            for r in rules:
                 try:
                     entries.append((r, *_parse_rule(r)))
                 except (ValueError, re.error) as e:
@@ -509,6 +513,29 @@ def trust(path: Path, text: str) -> None:
 
 
 # ------------------------------------------------------------------ loading
+def validate(doc: dict, where: str) -> None:
+    """Check one layer's rules while its path is still known.
+
+    Policy.__init__ catches the same mistakes, but by then the layers have been
+    merged and it can no longer say which file to go and fix.
+    """
+    for action in ACTIONS:
+        rules = doc.get(action)
+        if rules is None:
+            continue
+        if not isinstance(rules, list):
+            raise SystemExit(f"{where}: `{action}` must be a list of rules, "
+                             f"not {type(rules).__name__}")
+        for rule in rules:
+            if not isinstance(rule, str):
+                raise SystemExit(f"{where}: `{action}` holds {rule!r}, "
+                                 f"which is not a rule string")
+            try:
+                _parse_rule(rule)
+            except (ValueError, re.error) as e:
+                raise SystemExit(f"{where}: bad {action} rule '{_short(rule)}': {e}")
+
+
 def layers(root: Path) -> list[tuple[Path, bool]]:
     """The files that make up a policy, lowest first, with their trust."""
     out = [
@@ -541,6 +568,7 @@ def load(root: Path, prompt=None) -> Policy:
             raise SystemExit(f"policy file {p} is not valid JSON: {e}")
         if not isinstance(doc, dict):
             raise SystemExit(f"policy file {p} must hold a JSON object")
+        validate(doc, str(p))
         note = ""
         if not trusted:
             if is_trusted(p, text):
