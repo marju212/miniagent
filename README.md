@@ -1,25 +1,48 @@
 # miniagent
 
-A Claude Code-shaped coding agent in two files, tuned for **MiniMax-M2.5**.
+A Claude Code-shaped coding agent, tuned for **MiniMax-M2.5**. Python 3
+standard library only, no dependencies.
 
 Everything the agent may do comes out of a JSON rule file — the global one is
 `~/.miniagent/policy.json`. Nothing is baked into the loop: every tool call is
 put to the policy first and comes back **allow / ask / deny**.
 
-No dependencies outside the standard library.
+## Setup
 
 ```bash
-./miniagent --install                        # onto PATH, seeds the settings file
-$EDITOR "$(miniagent --env)"                 # put your API key in
+git clone https://github.com/marju212/miniagent && cd miniagent
 
-miniagent --init-policy                      # write the global rule file
-miniagent ~/code/my-project                  # interactive
-miniagent -p "fix the failing test" ~/code/my-project
+./miniagent --install            # symlink onto PATH, create the settings file
+$EDITOR "$(miniagent --env)"     # put your MiniMax API key in
+miniagent --init-policy          # optional: a global rule file you can edit
 ```
 
-`--install` symlinks the `miniagent` wrapper into `~/.local/bin`, and offers to
-put that on your `PATH` if it is not already. Nothing stops you calling
-`python3 agent.py ...` directly instead.
+`--install` links the wrapper into `~/.local/bin` and offers to put that on your
+`PATH` if it is not there already. Nothing stops you calling `python3 agent.py`
+directly instead — the wrapper only loads your settings first.
+
+## Use
+
+```bash
+miniagent ~/code/my-project                            # interactive session
+miniagent -p "fix the failing test" ~/code/my-project  # one shot, then exit
+miniagent                                              # the current directory
+```
+
+Type your task at the `>` prompt. The agent reads, edits and runs commands to
+do it, asking you before anything the rules do not already cover. `/help` lists
+the commands, `ctrl-c` leaves.
+
+## Where things live
+
+| path | what |
+|------|------|
+| `~/.miniagent/env` | your exports — API key, model, endpoint |
+| `~/.miniagent/policy.json` | the global rule file: what the agent may do |
+| `~/.miniagent/miniagent.md` | standing instructions for every project |
+| `~/.miniagent/trusted.json` | project rule files you have vouched for |
+| `<project>/.miniagent.md` | instructions for one project |
+| `<project>/.miniagent/policy.json` | rules for one project |
 
 Defaults point at MiniMax's OpenAI-compatible endpoint
 (`https://api.minimax.io/v1`, model `MiniMax-M2.5`). Set `AGENT_BASE_URL` and
@@ -28,8 +51,8 @@ Ollama, OpenRouter, OpenAI.
 
 ## Settings
 
-`~/.miniagent/env`, next to `policy.json`. The wrapper sources it as shell, so
-a key out of a password manager works:
+Your exports go in `~/.miniagent/env`. The wrapper sources it as shell, so a key
+out of a password manager works:
 
 ```bash
 export AGENT_API_KEY=$(pass show minimax/api)
@@ -128,6 +151,7 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 ```
 /help            /rules           the rules in force and where they came from
 /policy T SUBJ   explain one decision, e.g. /policy bash git push
+/notes           the standing instructions it was given
 /think           /cost            /reset           /quit
 ```
 
@@ -141,8 +165,24 @@ miniagent --check bash 'git push'    # explain one decision
 `read_file`, `write_file`, `edit_file`, `bash` — all confined to the working
 directory (plus anything in `allowed_roots`), all gated by the policy.
 
-A `AGENT.md` or `CLAUDE.md` in the project root is appended to the system
-prompt.
+## Telling it about your project
+
+Put a `.miniagent.md` in the project root and it is appended to the system
+prompt, the way `CLAUDE.md` is. `AGENT.md` and `CLAUDE.md` are read too, if that
+is what the repo already has — `.miniagent.md` wins, and only one is used.
+
+`~/.miniagent/miniagent.md` holds standing instructions that apply to every
+project, and is put ahead of the project's own.
+
+```markdown
+# This repo
+Tests live in tests/, run them with `pytest -q`.
+The generated client in src/gen/ is not to be edited by hand.
+```
+
+The project file arrives with the repository, so it is labelled as such in the
+prompt: it is guidance, not authority, and cannot widen what the rule file
+allows or excuse working around a refusal. `/notes` shows what is loaded.
 
 ## Environment
 
