@@ -1254,6 +1254,60 @@ class InteractiveSetup(unittest.TestCase):
         self.assertIn("enter to keep", out)
         self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-abcdefgh12345678")
 
+    # -- reading back what it wrote ---------------------------------------
+    # Every fixture above hand-writes *unquoted* values, which is not the
+    # format the installer produces. Twice now a parsing bug has survived the
+    # whole suite because nothing made the round trip through its own writer.
+    TRICKY = {
+        "plain": "sk-realkey123456",
+        "a quote": "sk-it's-fine",
+        "a backslash": "sk-a\\nb",
+        "a trailing backslash": "sk-ends-with\\",
+        "a hash": "sk-live#42",
+        "spaces": "sk with spaces",
+        "a command": "$(pass show minimax/api)",
+        "backticks": "sk-`whoami`",
+    }
+
+    def test_what_it_writes_it_can_read_back(self):
+        for what, key in self.TRICKY.items():
+            with self.subTest(what):
+                self.home = Path(tempfile.mkdtemp()).resolve()
+                self.run_tty(["--init"],
+                             [(r"endpoint \[", b"https://openrouter.ai/api/v1\r"),
+                              (r"model \[", b"my-model\r"),
+                              (r"api key", key.encode() + b"\r")])
+                self.assertEqual(self.exports()["AGENT_API_KEY"], key,
+                                 "the shell does not read back what was stored")
+                before = self.env_file.read_text(encoding="utf-8")
+
+                out = self.run_tty(["--install", str(self.bindir)])
+                self.assertIn("kept", out, f"it could not find its own key:\n{out}")
+                self.assertEqual(self.env_file.read_text(encoding="utf-8"), before,
+                                 "re-running rewrote the file")
+
+    def test_a_settings_file_it_wrote_seeds_the_prompts(self):
+        self.run_tty(["--init"],
+                     [(r"endpoint \[", b"https://openrouter.ai/api/v1\r"),
+                      (r"model \[", b"my-model\r"), (r"api key", b"\r")])
+        out = self.run_tty(["--install", str(self.bindir)],
+                           [(r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                            (r"api key", b"sk-late\r")])
+        self.assertIn("endpoint [https://openrouter.ai/api/v1]", out)
+        self.assertIn("model [my-model]", out)
+
+    def test_a_literal_key_is_masked_even_when_it_looks_like_shell(self):
+        # only a value that is *entirely* a command is a reference worth showing
+        out = self.run_tty(["--init"], self.ALL_DEFAULTS,
+                           env={"AGENT_API_KEY": "sk-`whoami`-abcd1234"})
+        self.assertNotIn("whoami", out)
+        self.assertIn("sk-`...1234", out)
+
+    def test_a_key_fetched_by_a_command_is_shown_rather_than_masked(self):
+        out = self.run_tty(["--init"], self.ALL_DEFAULTS,
+                           env={"AGENT_API_KEY": "$(pass show minimax/api)"})
+        self.assertIn("$(pass show minimax/api)", out)
+
     def test_a_world_readable_file_is_tightened_when_rewritten(self):
         # umask only governs creation, so writing into the existing file would
         # have left the key readable until the chmod after it

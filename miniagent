@@ -65,7 +65,9 @@ shq() {                                 # a value the settings file can hold ver
 
 mask() {
     case $1 in
-        *'$('*|*'`'*) printf '%s' "$1" ;;   # a reference, not the secret itself
+        # A whole value that is a command is a reference to the secret, not the
+        # secret. Anything else is masked, even if it happens to contain `$(`.
+        '$('*')'|'`'*'`') printf '%s' "$1" ;;
         *) if [ ${#1} -le 8 ]; then printf '****'
            else printf '%s...%s' "${1:0:4}" "${1: -4}"; fi ;;
     esac
@@ -75,25 +77,38 @@ mask() {
 # Read a setting out of the file rather than sourcing it. Sourcing would run
 # whatever the value is - `$(pass show ...)` and friends - which prompts for a
 # passphrase in the middle of an install, and reads as "no key" when the store
-# is locked or missing.
+# is locked or missing. So the quoting is undone here instead, the way the
+# shell would read it, without running anything.
 from_file() {
-    local line
     [ -f "$ENV_FILE" ] || return 1
-    line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "$ENV_FILE" | tail -1)
-    [ -n "$line" ] || return 1
-    line=${line#*=}
-    case $line in
-        \'*\') line=${line%%\'*} ;;         # keep quoted values whole
-    esac
-    line=${line%%#*}
-    line=${line#"${line%%[![:space:]]*}"}
-    line=${line%"${line##*[![:space:]]}"}
-    case $line in
-        \'*\') line=${line#\'}; line=${line%\'} ;;
-        \"*\") line=${line#\"}; line=${line%\"} ;;
-    esac
-    [ -n "$line" ] || return 1
-    printf '%s' "$line"
+    MA_NAME=$1 awk -v q="'" '
+        function unquote(v,   c, i, out) {
+            sub(/^[ \t]+/, "", v)
+            if (v == "") return ""
+            c = substr(v, 1, 1)
+            if (c == q || c == "\"") {
+                i = length(v)
+                while (i > 1 && substr(v, i, 1) != c) i--
+                if (i > 1) {
+                    out = substr(v, 2, i - 2)
+                    if (c == q) gsub(q "\\\\" q q, q, out)   # '"'"'\'"'"''"'"' is one quote
+                    return out
+                }
+            }
+            # unquoted: `#` only starts a comment after whitespace, so a value
+            # like sk-live#42 keeps its hash, as it would when sourced
+            if (match(v, /[ \t]+#/)) v = substr(v, 1, RSTART - 1)
+            sub(/[ \t]+$/, "", v)
+            return v
+        }
+        $0 ~ "^[ \t]*(export[ \t]+)?" ENVIRON["MA_NAME"] "=" {
+            line = $0
+            sub(/^[^=]*=/, "", line)
+            value = unquote(line)          # the last assignment wins, as when sourced
+            seen = 1
+        }
+        END { if (seen && value != "") { print value; exit 0 } exit 1 }
+    ' "$ENV_FILE"
 }
 
 
@@ -126,7 +141,11 @@ ask_secret() {
 # Replace the three settings and leave every other line of the file alone: it
 # may hold your own exports, comments, or a command that fetches the key.
 merge_env() {                           # merge_env URL_LINE MODEL_LINE KEY_LINE
-    awk -v url="$1" -v model="$2" -v key="$3" '
+    # through the environment, not `awk -v`: -v expands backslash escapes, so a
+    # key holding \n or ending in \ would be silently rewritten
+    MA_URL=$1 MA_MODEL=$2 MA_KEY=$3 awk '
+        BEGIN { url = ENVIRON["MA_URL"]; model = ENVIRON["MA_MODEL"]
+                key = ENVIRON["MA_KEY"] }
         function put(text, seen) { if (!seen) print text }
         /^[[:space:]]*(export[[:space:]]+)?AGENT_BASE_URL=/ { put(url, u); u = 1; next }
         /^[[:space:]]*(export[[:space:]]+)?AGENT_MODEL=/    { put(model, m); m = 1; next }
