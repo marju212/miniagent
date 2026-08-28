@@ -8,9 +8,12 @@ surviving the round trip - are checked end to end rather than by inspection.
     python3 -m unittest test_miniagent -v
 """
 
+import contextlib
+import io
 import json
 import os
 import pty
+import signal
 import re
 import select
 import shutil
@@ -637,6 +640,148 @@ class StoppedTurn(unittest.TestCase):
                 {"role": "tool", "tool_call_id": "c1", "content": "done"}]
         self.assertEqual(agent.close_dangling(msgs, "why"), 0)
         self.assertEqual(len(msgs), 2)
+
+
+# ---------------------------------------------------------------- shell
+class WorkingDirectory(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        agent.ROOTS[:] = [self.root]
+        self.home = os.environ["HOME"]
+
+    def tearDown(self):
+        os.environ["HOME"] = self.home
+
+    def cds_in_its_profile(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        (home / ".bash_profile").write_text("cd /\n", encoding="utf-8")
+        os.environ["HOME"] = str(home)
+
+    def test_a_profile_that_cds_cannot_move_a_command(self):
+        # a login shell runs the user's profile, and profiles do this: the
+        # Codespaces one cds to the workspace. The command must still land in
+        # the directory the policy just judged it against.
+        self.cds_in_its_profile()
+        self.assertIn(str(self.root), agent.t_bash("pwd"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIn(str(self.root), agent.shell_escape("!pwd"))
+
+    def test_the_login_shell_still_reads_the_profile(self):
+        home = Path(tempfile.mkdtemp())
+        (home / ".bash_profile").write_text("export FROM_PROFILE=yes\n", encoding="utf-8")
+        os.environ["HOME"] = str(home)
+        self.assertIn("yes", agent.t_bash("echo $FROM_PROFILE"))
+
+
+class ShellEscape(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        agent.ROOTS[:] = [self.root]
+
+    def run_it(self, line: str) -> str:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            got = agent.shell_escape(line)
+        self.echoed = out.getvalue()
+        return got
+
+    def test_it_keeps_the_output_for_the_model_and_echoes_it_to_you(self):
+        (self.root / "a.txt").write_text("x", encoding="utf-8")
+        got = self.run_it("!ls")
+        self.assertTrue(got.startswith("$ ls"))
+        self.assertIn("a.txt", got)
+        self.assertIn("a.txt", self.echoed)
+
+    def test_a_failing_command_carries_its_exit_code(self):
+        self.assertIn("(exit 3)", self.run_it("!exit 3"))
+
+    def test_stderr_is_kept_too(self):
+        self.assertIn("boom", self.run_it("!echo boom >&2"))
+
+    def test_it_cannot_be_left_waiting_for_input(self):
+        # stdin is closed, so something that reads gets EOF rather than hanging
+        self.assertIn("carried on", self.run_it("!read x; echo carried on"))
+
+    def test_an_empty_bang_asks_for_a_shell_rather_than_running_nothing(self):
+        calls = []
+        saved = agent.subprocess.run
+        agent.subprocess.run = lambda *a, **k: calls.append((a, k))
+        try:
+            self.assertEqual(self.run_it("!  "), "")
+        finally:
+            agent.subprocess.run = saved
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["cwd"], self.root)
+
+
+class Bar(unittest.TestCase):
+    def setUp(self):
+        self.bar = agent.StatusBar()
+        self._tty = agent._TTY
+        self._term = os.environ.get("TERM")
+        self._winch = signal.getsignal(signal.SIGWINCH)
+        os.environ["TERM"] = "xterm"
+        os.environ.pop("AGENT_STATUS", None)
+
+    def tearDown(self):
+        agent._TTY = self._tty
+        signal.signal(signal.SIGWINCH, self._winch)
+        if self._term is None:
+            os.environ.pop("TERM", None)
+        else:
+            os.environ["TERM"] = self._term
+
+    def drive(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ok = self.bar.install()
+            self.bar.draw("~/code/shop  main*")
+            self.bar.remove()
+        return ok, out.getvalue()
+
+    def test_it_reserves_the_last_row_draws_in_grey_and_gives_it_back(self):
+        agent._TTY = True
+        rows = shutil.get_terminal_size().lines
+        ok, out = self.drive()
+        self.assertTrue(ok)
+        self.assertIn(f"\033[1;{rows - 1}r", out)      # scrolling stops one short
+        self.assertIn(f"\033[{rows};1H", out)          # the bar goes on the last row
+        self.assertIn("\033[90m", out)                 # grey
+        self.assertIn("~/code/shop  main*", out)   # the gaps are not collapsed
+        self.assertIn("\033[r", out)                   # and the region is handed back
+        self.assertFalse(self.bar.on)
+
+    def test_it_saves_and_restores_the_cursor_around_every_move(self):
+        agent._TTY = True
+        _ok, out = self.drive()
+        self.assertEqual(out.count("\0337"), out.count("\0338"))
+
+    def test_it_stays_out_of_the_way_where_it_cannot_work(self):
+        for why, setup in (("no terminal", lambda: setattr(agent, "_TTY", False)),
+                           ("dumb terminal", lambda: os.environ.__setitem__("TERM", "dumb")),
+                           ("switched off", lambda: os.environ.__setitem__("AGENT_STATUS", "off"))):
+            agent._TTY = True
+            os.environ["TERM"] = "xterm"
+            os.environ.pop("AGENT_STATUS", None)
+            setup()
+            self.assertFalse(agent.StatusBar().install(), why)
+        os.environ.pop("AGENT_STATUS", None)
+
+    def test_a_long_status_is_cut_to_the_terminal_width(self):
+        agent._TTY = True
+        cols = shutil.get_terminal_size().columns
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.bar.install()
+            self.bar.draw("/very/long/" + "x" * 400 + "  main")
+            self.bar.remove()
+        # install() draws an empty bar first, so take the last one
+        drawn = re.findall(r"\033\[2K\033\[90m (.*?)\033\[0m", out.getvalue())[-1]
+        self.assertLessEqual(len(drawn), cols - 2)
+        self.assertTrue(drawn.endswith("..."), drawn[-20:])
+
+    def test_drawing_before_install_is_harmless(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.bar.draw("x")
+            self.bar.remove()
+        self.assertEqual(out.getvalue(), "")
 
 
 # ---------------------------------------------------------------- prompt

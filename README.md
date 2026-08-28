@@ -30,16 +30,42 @@ miniagent                                              # the current directory
 ```
 
 ```
-~/code/shop  feature/login*
-agent> anything to do?
+agent> fix the failing login test
+
+  · bash({"cmd": "pytest -q"})
+  · edit_file({"path": "auth.py"})
+
+Fixed the token check in auth.py.
+
+agent> ▏
+────────────────────────────────────────────────
+ ~/code/shop  feature/login*
 ```
 
-Type your task at the `agent>` prompt. The line above it is refreshed every
-time: where the agent is working, the branch, and a `*` if the tree is dirty —
-which can all change under you when the agent runs `git checkout`. The agent
-reads, edits and runs commands to do the task, asking you before anything the
-rules do not already cover. `/help` lists the commands, `ctrl-c` leaves.
-`AGENT_PROMPT` renames the prompt.
+Type your task at the `agent>` prompt. The agent reads, edits and runs commands
+to do it, asking you before anything the rules do not already cover. `/help`
+lists the commands, `ctrl-c` leaves. `AGENT_PROMPT` renames the prompt.
+
+A grey bar is pinned to the bottom row: where the agent is working, the branch,
+and a `*` if the tree is dirty — all of which can change under you when the
+agent runs `git checkout`. It stays put while tools run, since that is when you
+most want to see it. `AGENT_STATUS=off` turns it off, and it never appears when
+the output is not a terminal.
+
+### Running something yourself
+
+`!` at the prompt runs a command as you rather than through the agent, outside
+the policy — you typed it, the model did not. What came back is handed to the
+model with your next message, so this reads as one thought:
+
+```
+agent> !git diff --stat
+ auth.py | 12 ++++++------
+
+agent> undo the change to the token check
+```
+
+`!` on its own opens a shell; leave it and you are back at the prompt.
 
 The prompt has full line editing: **up arrow** walks back through what you have
 asked before, **ctrl-r** searches it, and the history carries over between
@@ -185,6 +211,7 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 /notes           the standing instructions it was given
 /think           /cost            /reset           /quit
 
+!cmd             run a command yourself; ! alone opens a shell
 up arrow         an earlier prompt; ctrl-r searches them
 ```
 
@@ -197,6 +224,11 @@ miniagent --check bash 'git push'    # explain one decision
 
 `read_file`, `write_file`, `edit_file`, `bash` — all confined to the working
 directory (plus anything in `allowed_roots`), all gated by the policy.
+
+`bash` runs a login shell, so whatever sets up your `PATH` — nvm, pyenv, a
+devcontainer profile — is in effect. Profile scripts are allowed to `cd` and
+some do, so the working directory is asserted again after they have run: a
+command always lands in the directory the policy just judged it against.
 
 ## Telling it about your project
 
@@ -231,6 +263,7 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_POLICY` | an extra rule file for one run |
 | `AGENT_THINKING` / `AGENT_YOLO` | off |
 | `AGENT_PROMPT` | `agent> ` |
+| `AGENT_STATUS` | on; `off` hides the bottom bar |
 | `AGENT_HISTORY` | `1000` lines kept |
 
 ## Tests

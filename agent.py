@@ -26,6 +26,8 @@ import os
 import re
 import select
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -194,12 +196,26 @@ def t_edit(path: str, old: str, new: str) -> str:
     return f"edited {_rel(p)}"
 
 
+def bash_argv(cmd: str) -> list:
+    """A login shell, so whatever sets up the user's PATH - nvm, pyenv, a
+    devcontainer profile - is in effect. Profile scripts are allowed to `cd`
+    though, and some do (Codespaces cds to the workspace), which would put the
+    command somewhere other than the directory the policy just judged it
+    against. So the directory is asserted again once they have run.
+    """
+    return ["bash", "-lc", 'cd -- "$MINIAGENT_CWD" || exit 1\n' + cmd]
+
+
+def bash_env() -> dict:
+    return {**os.environ, "MINIAGENT_CWD": str(ROOTS[0])}
+
+
 def t_bash(cmd: str, timeout: int = 120) -> str:
     cap = int(LIMITS.get("bash_timeout_max", 300))
     timeout = max(1, min(int(timeout), cap))
     try:
         r = subprocess.run(
-            ["bash", "-lc", cmd], cwd=ROOTS[0], capture_output=True,
+            bash_argv(cmd), cwd=ROOTS[0], env=bash_env(), capture_output=True,
             text=True, errors="replace", timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
@@ -312,6 +328,111 @@ def status_line(root: Path) -> str:
     if branch:
         parts.append(branch + ("*" if git_dirty(root) else ""))
     return "  ".join(parts)
+
+
+class StatusBar:
+    """A line pinned to the bottom row of the terminal.
+
+    The last row is taken out of the scrolling region, so everything the agent
+    prints scrolls above it and the bar stays where it is - visible while tools
+    are running, not only at the prompt.
+    """
+
+    def __init__(self):
+        self.on = False
+        self.text = ""
+
+    def install(self) -> bool:
+        if not _TTY or os.environ.get("AGENT_STATUS") == "off":
+            return False
+        if os.environ.get("TERM", "dumb") == "dumb":
+            return False
+        rows = shutil.get_terminal_size().lines
+        if rows < 3:
+            return False
+        # Make room for the bar. At the bottom of the screen this scrolls;
+        # anywhere else stepping back up undoes it.
+        sys.stdout.write("\n\033[1A")
+        # DECSTBM homes the cursor, so save and restore it around the change.
+        sys.stdout.write(f"\0337\033[1;{rows - 1}r\0338")
+        self.on = True
+        atexit.register(self.remove)
+        try:
+            signal.signal(signal.SIGWINCH, self._resized)
+        except (AttributeError, ValueError, OSError):
+            pass                    # no SIGWINCH here, or not the main thread
+        self.draw()
+        return True
+
+    def _resized(self, *_a) -> None:
+        if not self.on:
+            return
+        rows = shutil.get_terminal_size().lines
+        sys.stdout.write(f"\0337\033[1;{max(1, rows - 1)}r\0338")
+        self.draw()
+
+    def draw(self, text: str = None) -> None:
+        if text is not None:
+            self.text = text
+        if not self.on:
+            return
+        size = shutil.get_terminal_size()
+        # not _short(): it collapses runs of spaces, and the gaps between the
+        # fields are what makes the bar readable
+        room = max(1, size.columns - 2)
+        line = self.text if len(self.text) <= room else self.text[:room - 3] + "..."
+        sys.stdout.write(f"\0337\033[{size.lines};1H\033[2K"
+                         f"\033[90m {line}\033[0m\0338")
+        sys.stdout.flush()
+
+    def remove(self) -> None:
+        if not self.on:
+            return
+        self.on = False
+        rows = shutil.get_terminal_size().lines
+        sys.stdout.write(f"\0337\033[r\033[{rows};1H\033[2K\0338")
+        sys.stdout.flush()
+
+
+BAR = StatusBar()
+
+
+def shell_escape(line: str) -> str:
+    """`!cmd` runs it as you, outside the policy - you typed it, the model did
+    not. A bare `!` opens a shell. What came back is offered to the model with
+    your next message, so `!git diff` then "fix that" reads as one thought."""
+    cmd = line[1:].strip()
+    if not cmd:
+        BAR.remove()
+        try:
+            subprocess.run([os.environ.get("SHELL") or "/bin/bash"], cwd=ROOTS[0])
+        except OSError as e:
+            warn(str(e))
+        finally:
+            BAR.install()
+        return ""
+    try:
+        p = subprocess.Popen(bash_argv(cmd), cwd=ROOTS[0], env=bash_env(),
+                             text=True, errors="replace",
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as e:
+        warn(str(e))
+        return ""
+    out = []
+    try:
+        for chunk in p.stdout:      # echoed as it arrives, and kept
+            sys.stdout.write(chunk)
+            out.append(chunk)
+        code = p.wait()
+    except KeyboardInterrupt:
+        p.kill()
+        code = -1
+        print(yellow("  [interrupted]"))
+    body = "".join(out).strip()
+    if code:
+        body += f"\n(exit {code})"
+    return f"$ {cmd}\n{body}".strip()
 
 
 def prompt_text(text: str) -> str:
@@ -866,6 +987,7 @@ HELP = """  /help            this text
   /rules           the rules in force and where they came from
   /policy T SUBJ   explain one decision, e.g. /policy bash git push
   /notes           the standing instructions it was given
+  !cmd             run a command yourself; `!` alone opens a shell
   /think           toggle showing the model's reasoning
   up arrow         an earlier prompt; ctrl-r searches them
   /cost            tokens used this session
@@ -1030,22 +1152,39 @@ def main() -> None:
         print(dim(f"\n{USAGE}"))
         return
 
+    BAR.install()
+    mine: list = []          # what you ran with `!`, to hand over next message
+
     while True:
         try:
             print()
-            print(dim(status_line(root)))
+            if BAR.on:
+                BAR.draw(status_line(root))
+            else:
+                print(dim(status_line(root)))
             user = input(prompt_text(PROMPT)).strip()
             drop_repeat()
         except (EOFError, KeyboardInterrupt):
+            BAR.remove()
             print(dim(f"\n{USAGE}"))
             return
         if not user:
             continue
+        if user.startswith("!"):
+            got = shell_escape(user)
+            if got:
+                mine.append(got)
+            continue
         if user.startswith("/"):
             if not slash(pol, user, messages, system):
+                BAR.remove()
                 print(dim(f"{USAGE}"))
                 return
             continue
+        if mine:
+            user = ("Commands I ran myself just now:\n\n"
+                    + "\n\n".join(mine) + "\n\n" + user)
+            mine.clear()
         messages.append({"role": "user", "content": user})
         try:
             run_turn(pol, messages, max_steps)
