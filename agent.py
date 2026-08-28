@@ -19,6 +19,7 @@ AGENT_MODEL for any other /v1/chat/completions server (vLLM, SGLang, Ollama,
 OpenRouter, OpenAI).
 """
 
+import atexit
 import codecs
 import json
 import os
@@ -39,6 +40,13 @@ try:                       # raw keyboard input, for reading a bare escape
     import tty
 except ImportError:        # not POSIX
     termios = tty = None
+
+try:
+    # Importing it is the whole trick: input() then routes through readline,
+    # which is what gives the prompt arrow-key history, ctrl-r and editing.
+    import readline
+except ImportError:        # no line editing available
+    readline = None
 
 
 # ---------------------------------------------------------------- config
@@ -71,6 +79,7 @@ AUTO_APPROVE = os.environ.get("AGENT_YOLO") == "1"
 
 MINIMAX = "minimax" in (MODEL + BASE_URL).lower()
 GLOBAL_POLICY = Path.home() / ".miniagent" / "policy.json"
+HISTORY = Path.home() / ".miniagent" / "history"
 RETRY_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 # Request fields not every OpenAI-compatible server understands.  If one is
@@ -249,6 +258,49 @@ def suggest_rule(tool: str, subject: str) -> str:
             take = 2 if len(words) > 1 and not words[1].startswith("-") else 1
             return f"bash({pol_mod.escape_glob(' '.join(words[:take]))}*)"
     return f"{tool}({pol_mod.escape_glob(subject)})"
+
+
+def prompt_text(text: str) -> str:
+    """A prompt readline can measure.
+
+    It counts the prompt's width to know where to wrap and redraw an edited
+    line, so the colour codes have to be marked as taking up no space.
+    """
+    if not _TTY:
+        return text
+    return f"\001\033[1m\002{text}\001\033[0m\002"
+
+
+def load_history() -> None:
+    """Carry the prompt's history over from previous sessions."""
+    if readline is None:
+        return
+    readline.set_history_length(int(_env("AGENT_HISTORY", 1000, int)))
+    try:
+        readline.read_history_file(HISTORY)
+    except (OSError, ValueError):
+        pass                        # none yet, or one we cannot parse
+    atexit.register(save_history)
+
+
+def save_history() -> None:
+    if readline is None:
+        return
+    try:
+        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        readline.write_history_file(HISTORY)
+        HISTORY.chmod(0o600)        # it holds whatever you asked the agent
+    except OSError:
+        pass
+
+
+def drop_repeat() -> None:
+    """Keep arrow-up from walking through the same line several times."""
+    if readline is None:
+        return
+    n = readline.get_current_history_length()
+    if n > 1 and readline.get_history_item(n) == readline.get_history_item(n - 1):
+        readline.remove_history_item(n - 2)   # 0-based, unlike get_history_item
 
 
 class Interrupted(Exception):
@@ -761,6 +813,7 @@ HELP = """  /help            this text
   /policy T SUBJ   explain one decision, e.g. /policy bash git push
   /notes           the standing instructions it was given
   /think           toggle showing the model's reasoning
+  up arrow         an earlier prompt; ctrl-r searches them
   /cost            tokens used this session
   /reset           forget the conversation, keep the rules
   /quit            leave"""
@@ -908,6 +961,7 @@ def main() -> None:
     system = system_prompt(root, pol)
     messages = [{"role": "system", "content": system}]
 
+    load_history()
     print(bold(f"miniagent  {root}"))
     print(dim(f"  model {MODEL} @ {BASE_URL}"))
     print(dim(f"  rules {', '.join(pol.sources)}"))
@@ -924,7 +978,9 @@ def main() -> None:
 
     while True:
         try:
-            user = input(bold("\n> ")).strip()
+            print()
+            user = input(prompt_text("> ")).strip()
+            drop_repeat()
         except (EOFError, KeyboardInterrupt):
             print(dim(f"\n{USAGE}"))
             return

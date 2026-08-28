@@ -11,6 +11,8 @@ surviving the round trip - are checked end to end rather than by inspection.
 import json
 import os
 import pty
+import re
+import select
 import shutil
 import subprocess
 import sys
@@ -635,6 +637,103 @@ class StoppedTurn(unittest.TestCase):
                 {"role": "tool", "tool_call_id": "c1", "content": "done"}]
         self.assertEqual(agent.close_dangling(msgs, "why"), 0)
         self.assertEqual(len(msgs), 2)
+
+
+# ---------------------------------------------------------------- history
+@unittest.skipUnless(agent.readline is not None, "needs readline")
+class History(unittest.TestCase):
+    def setUp(self):
+        self.saved = [agent.readline.get_history_item(i + 1)
+                      for i in range(agent.readline.get_current_history_length())]
+        agent.readline.clear_history()
+        self._file, agent.HISTORY = agent.HISTORY, Path(tempfile.mkdtemp()) / "history"
+
+    def tearDown(self):
+        agent.readline.clear_history()
+        for line in self.saved:
+            agent.readline.add_history(line)
+        agent.HISTORY = self._file
+
+    def test_it_survives_a_session(self):
+        for line in ("first task", "second task"):
+            agent.readline.add_history(line)
+        agent.save_history()
+        self.assertEqual(agent.HISTORY.stat().st_mode & 0o777, 0o600)
+
+        agent.readline.clear_history()
+        agent.load_history()
+        got = [agent.readline.get_history_item(i + 1)
+               for i in range(agent.readline.get_current_history_length())]
+        self.assertEqual(got, ["first task", "second task"])
+
+    def test_a_repeated_line_is_not_stored_twice(self):
+        for line in ("a", "b", "b"):
+            agent.readline.add_history(line)
+        agent.drop_repeat()
+        got = [agent.readline.get_history_item(i + 1)
+               for i in range(agent.readline.get_current_history_length())]
+        self.assertEqual(got, ["a", "b"])   # get_history_item is 1-based,
+        agent.drop_repeat()                 # remove_history_item is not
+        self.assertEqual(agent.readline.get_current_history_length(), 2)
+
+    def test_missing_and_unreadable_files_are_survivable(self):
+        agent.load_history()                             # no file yet
+        agent.HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        agent.HISTORY.write_bytes(b"\xff\xfe not a history file\n")
+        agent.load_history()                             # must not raise
+
+    def test_the_prompt_marks_its_colour_codes_as_zero_width(self):
+        # readline measures the prompt to know where to redraw an edited line
+        p = agent.prompt_text("> ")
+        if agent._TTY:
+            self.assertTrue(p.startswith("\001"))
+            self.assertEqual(p.count("\001"), p.count("\002"))
+        self.assertIn("> ", p)
+
+
+@unittest.skipUnless(hasattr(pty, "openpty"), "needs a pty")
+class ArrowKeys(unittest.TestCase):
+    """input() only reaches readline when fd 0 really is the terminal, so the
+    agent has to be driven as a process under a pty rather than in-process."""
+
+    def read_until(self, master, pattern, seconds=20):
+        end = time.time() + seconds
+        while time.time() < end:
+            if select.select([master], [], [], 0.2)[0]:
+                self.buf += os.read(master, 4096).decode("utf-8", "replace")
+                if re.search(pattern, self.buf):
+                    return True
+        return False
+
+    def test_arrow_up_recalls_the_previous_prompt(self):
+        RESPONSES.clear()
+        REQUESTS.clear()
+        home, proj = tempfile.mkdtemp(), tempfile.mkdtemp()
+        master, slave = pty.openpty()
+        self.buf = ""
+        env = {"PATH": os.environ["PATH"], "HOME": home, "TERM": "xterm",
+               "AGENT_BASE_URL": os.environ["AGENT_BASE_URL"], "AGENT_API_KEY": "x"}
+        proc = subprocess.Popen([sys.executable, str(HERE / "agent.py"), proj],
+                                stdin=slave, stdout=slave, stderr=slave, env=env)
+        os.close(slave)
+        try:
+            self.assertTrue(self.read_until(master, r"> "), self.buf)
+            os.write(master, b"say hi\r")
+            self.assertTrue(self.read_until(master, r"done"), self.buf)
+            time.sleep(0.4)
+            os.write(master, b"\x1b[A")      # up arrow
+            time.sleep(0.4)
+            os.write(master, b"\r")
+            time.sleep(1.2)
+            os.write(master, b"/quit\r")
+            proc.wait(timeout=15)
+        finally:
+            proc.kill()
+            os.close(master)
+
+        asked = [[m for m in r["messages"] if m["role"] == "user"][-1]["content"]
+                 for r in REQUESTS]
+        self.assertEqual(asked, ["say hi", "say hi"], self.buf)
 
 
 # ---------------------------------------------------------------- wrapper

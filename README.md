@@ -33,6 +33,11 @@ Type your task at the `>` prompt. The agent reads, edits and runs commands to
 do it, asking you before anything the rules do not already cover. `/help` lists
 the commands, `ctrl-c` leaves.
 
+The prompt has full line editing: **up arrow** walks back through what you have
+asked before, **ctrl-r** searches it, and the history carries over between
+sessions in `~/.miniagent/history` (`0600`, since it holds whatever you asked
+for). `AGENT_HISTORY` sets how many lines are kept, default 1000.
+
 ## Where things live
 
 | path | what |
@@ -41,6 +46,7 @@ the commands, `ctrl-c` leaves.
 | `~/.miniagent/policy.json` | the global rule file: what the agent may do |
 | `~/.miniagent/miniagent.md` | standing instructions for every project |
 | `~/.miniagent/trusted.json` | project rule files you have vouched for |
+| `~/.miniagent/history` | what you have typed at the prompt |
 | `<project>/.miniagent.md` | instructions for one project |
 | `<project>/.miniagent/policy.json` | rules for one project |
 
@@ -170,6 +176,8 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 /policy T SUBJ   explain one decision, e.g. /policy bash git push
 /notes           the standing instructions it was given
 /think           /cost            /reset           /quit
+
+up arrow         an earlier prompt; ctrl-r searches them
 ```
 
 ```bash
