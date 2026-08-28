@@ -127,45 +127,117 @@ class Decision(NamedTuple):
 
 
 # ------------------------------------------------------------------ globs
-def _translate(pat: str, sep_sensitive: bool) -> re.Pattern:
-    """Glob -> regex.  With sep_sensitive, `*` stops at `/` and `**` does not."""
-    out, i = [], 0
-    while i < len(pat):
-        c = pat[i]
-        if c == "*":
-            if sep_sensitive and pat[i:i + 3] == "**/":
-                out.append("(?:[^/]+/)*")
-                i += 3
+MAX_PATTERN = 1024
+
+
+def _any_char(_c: str) -> bool:
+    return True
+
+
+def _not_sep(c: str) -> bool:
+    return c != "/"
+
+
+def _char_class(inner: str):
+    """A one-character class.  `re` is safe here - a class cannot backtrack."""
+    inner = inner.replace("\\", "\\\\").replace("[", "\\[")   # `[[]` warns about a nested set
+    rx = re.compile("[" + inner + "]", re.DOTALL)
+    return rx.match
+
+
+class Glob:
+    """A compiled glob pattern.
+
+    Matching is a linear sweep, not a regex search.  Translated to a regex,
+    `*x*x*x*xz` costs seconds of backtracking against a few hundred characters,
+    and rule files can arrive with a repository - so how a pattern is *written*
+    must not decide how long it takes to judge a command.  Cost here is
+    len(pattern) x len(subject), and the pattern is bounded.
+
+    With sep_sensitive, `*` stops at `/`, `**` does not, and `**/` spans whole
+    path segments.
+    """
+
+    __slots__ = ("source", "tokens", "_needs_slashes")
+
+    LIT, ONE, STAR, SEGS = 0, 1, 2, 3   # token kinds
+
+    def __init__(self, pattern: str, sep_sensitive: bool):
+        if len(pattern) > MAX_PATTERN:
+            raise ValueError(f"pattern is longer than {MAX_PATTERN} characters")
+        self.source = pattern
+        self.tokens = self._tokenize(pattern, sep_sensitive)
+        self._needs_slashes = any(k == self.SEGS for k, _ in self.tokens)
+
+    @classmethod
+    def _tokenize(cls, pat: str, sep: bool) -> list:
+        out, i = [], 0
+        while i < len(pat):
+            c = pat[i]
+            if c == "*":
+                if sep and pat[i:i + 3] == "**/":
+                    out.append((cls.SEGS, None))
+                    i += 3
+                elif pat[i:i + 2] == "**":
+                    out.append((cls.STAR, True))
+                    i += 2
+                else:
+                    out.append((cls.STAR, not sep))
+                    i += 1
                 continue
-            if pat[i:i + 2] == "**":
-                out.append(".*")
-                i += 2
-                continue
-            out.append("[^/]*" if sep_sensitive else ".*")
-            i += 1
-            continue
-        if c == "?":
-            out.append("[^/]" if sep_sensitive else ".")
-            i += 1
-            continue
-        if c == "[":
-            j = pat.find("]", i + 1)
-            if j == -1:
-                out.append(re.escape(c))
+            if c == "?":
+                out.append((cls.ONE, _not_sep if sep else _any_char))
                 i += 1
                 continue
-            inner = pat[i + 1:j]
-            if not inner:  # `[]` is an empty class to `re`, not a literal `[`
-                out.append(re.escape(c))
-                i += 1
+            if c == "[":
+                j = pat.find("]", i + 1)
+                if j <= i + 1:  # a lone `[`, or `[]`, which is no class at all
+                    out.append((cls.LIT, c))
+                    i += 1
+                    continue
+                inner = pat[i + 1:j]
+                inner = ("^" + inner[1:]) if inner.startswith("!") else inner
+                out.append((cls.ONE, _char_class(inner)))
+                i = j + 1
                 continue
-            inner = ("^" + inner[1:]) if inner.startswith("!") else inner
-            out.append("[" + inner.replace("\\", "\\\\") + "]")
-            i = j + 1
-            continue
-        out.append(re.escape(c))
-        i += 1
-    return re.compile("^" + "".join(out) + "$", re.DOTALL)
+            out.append((cls.LIT, c))
+            i += 1
+        return out
+
+    def match(self, subject: str) -> bool:
+        """Does the whole subject match?  One pass per token, no backtracking."""
+        n = len(subject)
+
+        # For `**/`: the next `/` at or after each position, n if there is none.
+        after = None
+        if self._needs_slashes:
+            after = [n] * (n + 1)
+            for si in range(n - 1, -1, -1):
+                after[si] = si if subject[si] == "/" else after[si + 1]
+
+        # row[si] answers "does the rest of the pattern match subject[si:]",
+        # so the empty rest of a pattern matches only the empty rest of the
+        # subject.  Each token rebuilds the row from the one behind it.
+        row = [False] * (n + 1)
+        row[n] = True
+        for kind, arg in reversed(self.tokens):
+            prev, row = row, [False] * (n + 1)
+            if kind == Glob.LIT:
+                for si in range(n - 1, -1, -1):
+                    row[si] = subject[si] == arg and prev[si + 1]
+            elif kind == Glob.ONE:
+                for si in range(n - 1, -1, -1):
+                    row[si] = bool(arg(subject[si])) and prev[si + 1]
+            elif kind == Glob.STAR:
+                row[n] = prev[n]
+                for si in range(n - 1, -1, -1):
+                    row[si] = prev[si] or ((arg or subject[si] != "/") and row[si + 1])
+            else:  # SEGS: zero or more `[^/]+/`, and the segment end is forced
+                row[n] = prev[n]
+                for si in range(n - 1, -1, -1):
+                    k = after[si]
+                    row[si] = prev[si] or (si < k < n and row[k + 1])
+        return row[0]
 
 
 def escape_glob(s: str) -> str:
@@ -219,7 +291,8 @@ def split_command(cmd: str) -> list[str]:
         buf.append(c)
         i += 1
     segs.append("".join(buf))
-    return [s.strip().lstrip("({").strip() for s in segs if s.strip().lstrip("({").strip()]
+    cleaned = (s.strip().lstrip("({").strip() for s in segs)
+    return [s for s in cleaned if s]
 
 
 def unsafe_syntax(cmd: str) -> str:
@@ -249,7 +322,7 @@ class Policy:
                 try:
                     entries.append((r, *_parse_rule(r)))
                 except (ValueError, re.error) as e:
-                    raise SystemExit(f"policy: bad {action} rule {r!r}: {e}")
+                    raise SystemExit(f"policy: bad {action} rule '{_short(r)}': {e}")
             self._compiled[action] = entries
 
     # -- matching -----------------------------------------------------
@@ -288,7 +361,7 @@ class Policy:
             if d.action == "allow" and self.bash_opts.get("strict_syntax", True):
                 why = unsafe_syntax(seg)
                 if why:
-                    d = Decision("ask", f"{why} cannot be auto-allowed", d.rule)
+                    d = Decision("ask", f"{why} cannot be auto-allowed", d.rule, seg)
             if _RANK[d.action] < _RANK[worst.action]:
                 worst = d._replace(reason=f"`{_short(seg)}`: {d.reason}", subject=seg)
             if worst.action == "deny":
@@ -343,7 +416,7 @@ def _parse_rule(rule: str):
     if pat is None:
         return tool, None, False
     sep = tool != "bash"
-    return tool, _translate(pat, sep), sep
+    return tool, Glob(pat, sep), sep
 
 
 def _stricter(a: str, b: str) -> str:

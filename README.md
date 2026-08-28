@@ -1,6 +1,6 @@
 # miniagent
 
-A Claude Code-shaped coding agent, tuned for **MiniMax-M2.5**. Python 3
+A Claude Code-shaped coding agent, tuned for **MiniMax-M2.5**. Python 3.9+,
 standard library only, no dependencies.
 
 Everything the agent may do comes out of a JSON rule file — the global one is

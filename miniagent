@@ -62,7 +62,7 @@ write_env_template() {
 
 export AGENT_API_KEY=                            # MiniMax key (or MINIMAX_API_KEY)
 export AGENT_MODEL=MiniMax-M2.5                  # or MiniMax-M2.5-highspeed
-export AGENT_BASE_URL=https://api.minimax.io/v1  # api.minimaxi.com/v1 in China
+export AGENT_BASE_URL=https://api.minimax.io/v1  # or any /v1/chat/completions server
 
 # A key out of a password manager works too:
 # export AGENT_API_KEY=$(pass show minimax/api)

@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -80,6 +82,35 @@ class Globs(unittest.TestCase):
         for p in (".env", "a/.env", "a/b/c/.env"):
             self.assertEqual(pol.check("read_file", {"path": p}).action, "deny", p)
 
+    def test_a_hostile_pattern_cannot_stall_the_matcher(self):
+        # As a regex this is `.*x.*x...z`, which costs seconds of backtracking
+        # against a long subject. Rule files can arrive with a repository, so
+        # how a pattern is written must not decide how long judging one takes.
+        pol = make_policy(deny=["bash(" + "*x" * 12 + "z)"])
+        started = time.perf_counter()
+        self.assertEqual(pol.check("bash", {"cmd": "x" * 2000}).action, "ask")
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_many_path_segments_stay_fast_too(self):
+        pol = make_policy(deny=["read_file(" + "**/" * 20 + "nope)"])
+        started = time.perf_counter()
+        pol.check("read_file", {"path": "a/" * 300 + "x"})
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_a_pattern_past_the_cap_is_refused_by_name(self):
+        with self.assertRaises(SystemExit) as e:
+            make_policy(deny=["bash(" + "*" * (policy.MAX_PATTERN + 1) + ")"])
+        self.assertIn("longer than", str(e.exception))
+        self.assertLess(len(str(e.exception)), 300)   # not the whole rule
+
+    def test_a_bracket_in_a_saved_rule_compiles_quietly(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            pol = make_policy(deny=[f"read_file({policy.escape_glob('a[b')})"],
+                              allow=["read_file(**)"])
+        self.assertEqual(pol.check("read_file", {"path": "a[b"}).action, "deny")
+        self.assertEqual(pol.check("read_file", {"path": "axb"}).action, "allow")
+
     def test_escape_glob_survives_brackets_and_stars(self):
         for literal in ("a*b", "a?b", "we[i]rd", "trail]ing", "[both]"):
             rule = f"read_file({policy.escape_glob(literal)})"
@@ -113,6 +144,12 @@ class Decisions(unittest.TestCase):
         self.assertEqual(pol.check("bash", {"cmd": "ls > out.txt"}).action, "ask")
         self.assertEqual(pol.check("bash", {"cmd": "echo $(whoami)"}).action, "ask")
         self.assertEqual(pol.check("bash", {"cmd": "ls 2>&1"}).action, "allow")
+
+    def test_a_downgraded_segment_still_names_itself(self):
+        pol = make_policy(allow=["bash(echo *)"])
+        d = pol.check("bash", {"cmd": "echo hi > out.txt"})
+        self.assertEqual(d.action, "ask")
+        self.assertEqual(d.subject, "echo hi > out.txt")
 
     def test_unmatched_calls_fall_to_default_action(self):
         self.assertEqual(make_policy().check("bash", {"cmd": "frobnicate"}).action, "ask")
