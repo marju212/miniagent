@@ -1070,10 +1070,16 @@ class InteractiveSetup(unittest.TestCase):
     def env_file(self) -> Path:
         return self.home / ".miniagent" / "env"
 
+    def write_env(self, text: str, mode: int = 0o600) -> None:
+        self.env_file.parent.mkdir(parents=True, exist_ok=True)
+        self.env_file.write_text(text, encoding="utf-8")
+        self.env_file.chmod(mode)
+
     def exports(self) -> dict:
         """What the file is worth to a shell - the wrapper sources it, so a
         parser that just strips quotes would judge the escaping wrongly."""
-        names = ("AGENT_BASE_URL", "AGENT_MODEL", "AGENT_API_KEY")
+        names = ("AGENT_BASE_URL", "AGENT_MODEL", "AGENT_API_KEY",
+                 "AGENT_TEMPERATURE", "AGENT_POLICY")
         script = (f'. "{self.env_file}"; '
                   'for v in ' + " ".join(names) + '; do printf "%s=%s\\0" "$v" "${!v-}"; done')
         r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
@@ -1085,7 +1091,11 @@ class InteractiveSetup(unittest.TestCase):
                 got[key] = val
         return got
 
-    def run_tty(self, args, answers, env=None):
+    def run_tty(self, args, steps=(), env=None, seconds=15):
+        """Each step is (prompt to wait for, keys to send). Waiting for the
+        prompt rather than sleeping matters for the secret: the line discipline
+        echoes input when it *arrives*, so sending early would echo the key
+        before `read -s` has had a chance to turn echo off."""
         master, slave = pty.openpty()
         e = {"PATH": f"{self.bindir}:{os.environ['PATH']}", "HOME": str(self.home),
              "TERM": "xterm", "SHELL": "/bin/bash"}
@@ -1093,43 +1103,50 @@ class InteractiveSetup(unittest.TestCase):
         proc = subprocess.Popen([str(WRAPPER), *args], stdin=slave, stdout=slave,
                                 stderr=slave, env=e)
         os.close(slave)
-        buf = ""
+        self.out = ""
 
-        def pump(seconds=1.2):
-            nonlocal buf
+        def pump(until=None, seconds=8.0):
             end = time.time() + seconds
             while time.time() < end:
+                if until and re.search(until, self.out):
+                    return True
                 try:
                     if select.select([master], [], [], 0.1)[0]:
                         chunk = os.read(master, 8192)
                         if not chunk:
-                            return
-                        buf += chunk.decode("utf-8", "replace")
-                except OSError:
-                    return
-
-        try:
-            pump(1.5)
-            for answer in answers:
-                try:
-                    os.write(master, answer)
+                            break
+                        self.out += chunk.decode("utf-8", "replace")
                 except OSError:
                     break
-                pump()
-            proc.wait(timeout=15)
+            return bool(until and re.search(until, self.out))
+
+        try:
+            for pattern, keys in steps:
+                self.assertTrue(pump(pattern), f"never saw {pattern!r} in:\n{self.out}")
+                try:
+                    os.write(master, keys)
+                except OSError:
+                    break
+            pump(seconds=3.0)
+            proc.wait(timeout=seconds)
         finally:
             proc.kill()
             try:
                 os.close(master)
             except OSError:
                 pass
-        return buf.replace("\r\n", "\n")
+        self.out = self.out.replace("\r\n", "\n")
+        return self.out
 
+    ALL_DEFAULTS = ((r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                    (r"api key", b"\r"))
+
+    # -- a fresh install ---------------------------------------------------
     def test_init_asks_for_the_three_settings_and_saves_them(self):
         out = self.run_tty(["--init"],
-                           [b"\r",                            # take the default
-                            b"MiniMax-M2.5-highspeed\r",
-                            b"sk-super-secret-123\r"])
+                           [(r"endpoint \[", b"\r"),
+                            (r"model \[", b"MiniMax-M2.5-highspeed\r"),
+                            (r"api key", b"sk-super-secret-123\r")])
         self.assertIn("endpoint [https://api.minimax.io/v1]", out)
         got = self.exports()
         self.assertEqual(got["AGENT_BASE_URL"], "https://api.minimax.io/v1")
@@ -1138,38 +1155,29 @@ class InteractiveSetup(unittest.TestCase):
         self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
 
     def test_the_key_is_never_echoed(self):
-        out = self.run_tty(["--init"], [b"\r", b"\r", b"sk-super-secret-123\r"])
+        out = self.run_tty(["--init"],
+                           [(r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                            (r"api key", b"sk-super-secret-123\r")])
         self.assertNotIn("sk-super-secret-123", out)
 
     def test_install_asks_when_there_is_nothing_to_go_on(self):
         out = self.run_tty(["--install", str(self.bindir)],
-                           [b"https://openrouter.ai/api/v1\r",
-                            b"minimax/minimax-m2.5\r", b"sk-or-1\r"])
+                           [(r"endpoint \[", b"https://openrouter.ai/api/v1\r"),
+                            (r"model \[", b"minimax/minimax-m2.5\r"),
+                            (r"api key", b"sk-or-1\r")])
         self.assertIn("linked", out)
         self.assertEqual(self.exports()["AGENT_BASE_URL"], "https://openrouter.ai/api/v1")
         self.assertTrue((self.bindir / "miniagent").is_symlink())
 
-    def test_a_settings_file_without_a_key_is_offered_the_prompts(self):
-        self.env_file.parent.mkdir(parents=True)
-        self.env_file.write_text("export AGENT_API_KEY=\n", encoding="utf-8")
-        out = self.run_tty(["--install", str(self.bindir)], [b"\r", b"\r", b"sk-late\r"])
-        self.assertIn("no API key", out)
-        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-late")
-
-    def test_a_key_already_in_the_environment_is_taken_and_masked(self):
-        out = self.run_tty(["--init"], [b"\r", b"\r"],
-                           env={"AGENT_API_KEY": "sk-abcdefgh12345678"})
-        self.assertIn("sk-a...5678", out)
-        self.assertNotIn("sk-abcdefgh12345678", out)
-        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-abcdefgh12345678")
-
     def test_a_key_with_a_quote_in_it_survives_the_round_trip(self):
         # the file is sourced as shell, so an unescaped quote would break it
-        self.run_tty(["--init"], [b"\r", b"\r", b"sk-it's-fine\r"])
+        self.run_tty(["--init"], [(r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                                  (r"api key", b"sk-it's-fine\r")])
         self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-it's-fine")
 
     def test_a_key_that_looks_like_shell_is_not_run(self):
-        self.run_tty(["--init"], [b"\r", b"\r", b"sk-$(id -u)-`whoami`\r"])
+        self.run_tty(["--init"], [(r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                                  (r"api key", b"sk-$(id -u)-`whoami`\r")])
         self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-$(id -u)-`whoami`")
 
     def test_without_a_terminal_it_writes_defaults_instead_of_asking(self):
@@ -1179,6 +1187,81 @@ class InteractiveSetup(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.exports()["AGENT_MODEL"], "MiniMax-M2.5")
         self.assertEqual(self.exports()["AGENT_API_KEY"], "")
+        self.assertIn("no key yet", r.stderr + r.stdout)   # it says so
+
+    # -- a settings file that is already there -----------------------------
+    MINE = ("# my own notes\n"
+            "export AGENT_BASE_URL=https://openrouter.ai/api/v1\n"
+            "export AGENT_MODEL=MiniMax-M2.5-highspeed\n"
+            "export AGENT_API_KEY=\n"
+            "export AGENT_TEMPERATURE=0.7\n"
+            "export AGENT_POLICY=/home/me/rules.json\n")
+
+    def test_the_rest_of_an_existing_file_is_left_alone(self):
+        self.write_env(self.MINE)
+        self.run_tty(["--install", str(self.bindir)],
+                     [(r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                      (r"api key", b"sk-new-key\r")])
+        got = self.exports()
+        self.assertEqual(got["AGENT_API_KEY"], "sk-new-key")
+        self.assertEqual(got["AGENT_TEMPERATURE"], "0.7")        # not swept away
+        self.assertEqual(got["AGENT_POLICY"], "/home/me/rules.json")
+        self.assertIn("# my own notes", self.env_file.read_text(encoding="utf-8"))
+
+    def test_the_prompts_offer_what_the_file_already_says(self):
+        # pressing enter through is what the tool tells you to do, so the
+        # defaults had better not be the stock ones
+        self.write_env(self.MINE)
+        out = self.run_tty(["--install", str(self.bindir)],
+                           [(r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                            (r"api key", b"sk-k\r")])
+        self.assertIn("endpoint [https://openrouter.ai/api/v1]", out)
+        self.assertIn("model [MiniMax-M2.5-highspeed]", out)
+        got = self.exports()
+        self.assertEqual(got["AGENT_BASE_URL"], "https://openrouter.ai/api/v1")
+        self.assertEqual(got["AGENT_MODEL"], "MiniMax-M2.5-highspeed")
+
+    def test_a_key_fetched_by_a_command_counts_as_a_key(self):
+        # sourcing the file to find out would run the password manager, and a
+        # locked one would read as "no key" - and then be overwritten
+        self.write_env("export AGENT_API_KEY=$(pass show minimax/api)\n")
+        out = self.run_tty(["--install", str(self.bindir)])
+        self.assertIn("kept", out)
+        self.assertIn("$(pass show minimax/api)",
+                      self.env_file.read_text(encoding="utf-8"))
+
+    def test_install_leaves_a_file_that_already_has_a_key_alone(self):
+        self.write_env("export AGENT_API_KEY=sk-abcdefgh12345678\n")
+        out = self.run_tty(["--install", str(self.bindir)])
+        self.assertIn("kept", out)          # nothing to ask about
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-abcdefgh12345678")
+
+    def test_a_key_in_the_environment_can_still_be_replaced(self):
+        # taking it silently would pair, say, a MiniMax key with an OpenRouter
+        # endpoint typed at the prompt above it
+        out = self.run_tty(["--init"],
+                           [(r"endpoint \[", b"https://openrouter.ai/api/v1\r"),
+                            (r"model \[", b"\r"),
+                            (r"api key", b"sk-or-typed\r")],
+                           env={"AGENT_API_KEY": "sk-abcdefgh12345678"})
+        self.assertIn("enter to keep sk-a...5678", out)
+        self.assertNotIn("sk-abcdefgh12345678", out)
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-or-typed")
+
+    def test_enter_at_the_key_prompt_keeps_what_was_there(self):
+        out = self.run_tty(["--init"], self.ALL_DEFAULTS,
+                           env={"AGENT_API_KEY": "sk-abcdefgh12345678"})
+        self.assertIn("enter to keep", out)
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-abcdefgh12345678")
+
+    def test_a_world_readable_file_is_tightened_when_rewritten(self):
+        # umask only governs creation, so writing into the existing file would
+        # have left the key readable until the chmod after it
+        self.write_env(self.MINE, mode=0o644)
+        self.run_tty(["--install", str(self.bindir)],
+                     [(r"endpoint \[", b"\r"), (r"model \[", b"\r"),
+                      (r"api key", b"sk-new\r")])
+        self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
 
 
 @unittest.skipUnless(WRAPPER.is_file() and shutil.which("bash"), "needs bash")

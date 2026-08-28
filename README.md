@@ -18,7 +18,7 @@ git clone https://github.com/marju212/miniagent && cd miniagent
 linked  ~/.local/bin/miniagent -> ~/code/miniagent/miniagent
 
 settings -> ~/.miniagent/env
-  press enter to take the default
+  press enter to keep what is shown
   endpoint [https://api.minimax.io/v1]: ▏
   model [MiniMax-M2.5]:
   api key (hidden; enter to fill in later):
@@ -28,9 +28,14 @@ ready   ~/.local/bin is on your PATH
 
 `--install` links the wrapper into `~/.local/bin`, asks for the three settings
 it needs, and offers to put that directory on your `PATH` if it is not there
-already. Anything already exported is taken as the default, the key is not
-echoed, and skipping it leaves the file ready to fill in later. With no
-terminal — a script, a pipe — it writes the defaults instead of asking.
+already. The key is not echoed, and skipping it leaves the file ready to fill
+in later. With no terminal — a script, a pipe — it writes the defaults instead
+of asking.
+
+Run it again whenever you like: it is safe on a settings file that already
+exists. The prompts are seeded from what the file says, only those three lines
+are rewritten, and everything else — your own exports, your comments, a key
+fetched by `$(pass show …)` — is left exactly as it was.
 
 `miniagent --init-policy` then writes a global rule file you can edit, if you
 want to start from something other than the built-in defaults. Nothing stops

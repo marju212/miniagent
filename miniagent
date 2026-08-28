@@ -64,7 +64,42 @@ shq() {                                 # a value the settings file can hold ver
 
 
 mask() {
-    if [ ${#1} -le 8 ]; then printf '****'; else printf '%s...%s' "${1:0:4}" "${1: -4}"; fi
+    case $1 in
+        *'$('*|*'`'*) printf '%s' "$1" ;;   # a reference, not the secret itself
+        *) if [ ${#1} -le 8 ]; then printf '****'
+           else printf '%s...%s' "${1:0:4}" "${1: -4}"; fi ;;
+    esac
+}
+
+
+# Read a setting out of the file rather than sourcing it. Sourcing would run
+# whatever the value is - `$(pass show ...)` and friends - which prompts for a
+# passphrase in the middle of an install, and reads as "no key" when the store
+# is locked or missing.
+from_file() {
+    local line
+    [ -f "$ENV_FILE" ] || return 1
+    line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "$ENV_FILE" | tail -1)
+    [ -n "$line" ] || return 1
+    line=${line#*=}
+    case $line in
+        \'*\') line=${line%%\'*} ;;         # keep quoted values whole
+    esac
+    line=${line%%#*}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case $line in
+        \'*\') line=${line#\'}; line=${line%\'} ;;
+        \"*\") line=${line#\"}; line=${line%\"} ;;
+    esac
+    [ -n "$line" ] || return 1
+    printf '%s' "$line"
+}
+
+
+env_has_key() {
+    [ -f "$ENV_FILE" ] || return 1
+    from_file AGENT_API_KEY >/dev/null || from_file MINIMAX_API_KEY >/dev/null
 }
 
 
@@ -88,21 +123,29 @@ ask_secret() {
 }
 
 
-write_env_file() {                      # write_env_file URL MODEL KEY
-    mkdir -p "$(dirname "$ENV_FILE")"
-    (
-        umask 077
-        {
-            cat <<'EOF'
+# Replace the three settings and leave every other line of the file alone: it
+# may hold your own exports, comments, or a command that fetches the key.
+merge_env() {                           # merge_env URL_LINE MODEL_LINE KEY_LINE
+    awk -v url="$1" -v model="$2" -v key="$3" '
+        function put(text, seen) { if (!seen) print text }
+        /^[[:space:]]*(export[[:space:]]+)?AGENT_BASE_URL=/ { put(url, u); u = 1; next }
+        /^[[:space:]]*(export[[:space:]]+)?AGENT_MODEL=/    { put(model, m); m = 1; next }
+        /^[[:space:]]*(export[[:space:]]+)?AGENT_API_KEY=/  { put(key, k); k = 1; next }
+        { print }
+        END { put(url, u); put(model, m); put(key, k) }
+    '
+}
+
+
+fresh_env() {                           # fresh_env URL_LINE MODEL_LINE KEY_LINE
+    cat <<'EOF'
 # miniagent settings.  Sourced by the `miniagent` wrapper as shell, so command
 # substitution works.  Anything already set in your shell wins over what is
 # here.  Keep it private - it holds your API key.
 
 EOF
-            printf 'export AGENT_BASE_URL=%s\n' "$(shq "$1")"
-            printf 'export AGENT_MODEL=%s\n'    "$(shq "$2")"
-            printf 'export AGENT_API_KEY=%s\n'  "$(shq "$3")"
-            cat <<'EOF'
+    printf '%s\n%s\n%s\n' "$1" "$2" "$3"
+    cat <<'EOF'
 
 # A key out of a password manager works too:
 # export AGENT_API_KEY=$(pass show minimax/api)
@@ -118,45 +161,56 @@ EOF
 # export AGENT_YOLO=1         # auto-approve every `ask` (a `deny` still holds)
 # export AGENT_POLICY=        # an extra rule file for every run
 EOF
-        } > "$ENV_FILE"
-    )
-    chmod 600 "$ENV_FILE"
+}
+
+
+write_env_file() {                      # write_env_file URL MODEL KEY
+    local dir tmp
+    dir=$(dirname "$ENV_FILE")
+    mkdir -p "$dir"
+    tmp=$(mktemp "$dir/env.XXXXXX") || die "cannot write in $dir"
+    # 600 before the key goes in: `> "$ENV_FILE"` would have kept an existing
+    # file's mode, leaving the key world-readable until the chmod afterwards
+    chmod 600 "$tmp"
+    if [ -f "$ENV_FILE" ]; then
+        merge_env "export AGENT_BASE_URL=$(shq "$1")" \
+                  "export AGENT_MODEL=$(shq "$2")" \
+                  "export AGENT_API_KEY=$(shq "$3")" < "$ENV_FILE" > "$tmp"
+    else
+        fresh_env "export AGENT_BASE_URL=$(shq "$1")" \
+                  "export AGENT_MODEL=$(shq "$2")" \
+                  "export AGENT_API_KEY=$(shq "$3")" > "$tmp"
+    fi
+    mv "$tmp" "$ENV_FILE"
 }
 
 
 setup_env() {
-    local url model key
-    if ! interactive; then              # a pipe or a script: leave it to be edited
-        write_env_file "${AGENT_BASE_URL:-https://api.minimax.io/v1}" \
-                       "${AGENT_MODEL:-MiniMax-M2.5}" \
-                       "${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}"
-        return
-    fi
+    local url model key had shown
 
-    printf '\nsettings -> %s\n' "$ENV_FILE" >&2
-    printf '  press enter to take the default\n' >&2
-    url=$(ask "endpoint" "${AGENT_BASE_URL:-https://api.minimax.io/v1}")
-    model=$(ask "model" "${AGENT_MODEL:-MiniMax-M2.5}")
+    url=$(from_file AGENT_BASE_URL)  || url=${AGENT_BASE_URL:-https://api.minimax.io/v1}
+    model=$(from_file AGENT_MODEL)   || model=${AGENT_MODEL:-MiniMax-M2.5}
+    had=$(from_file AGENT_API_KEY)   || had=${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}
 
-    key=${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}
-    if [ -n "$key" ]; then
-        printf '  api key: taking the one already in your environment (%s)\n' \
-               "$(mask "$key")" >&2
-    else
-        key=$(ask_secret "api key (hidden; enter to fill in later)")
+    if interactive; then
+        printf '\nsettings -> %s\n' "$ENV_FILE" >&2
+        printf '  press enter to keep what is shown\n' >&2
+        url=$(ask "endpoint" "$url")
+        model=$(ask "model" "$model")
+        if [ -n "$had" ]; then
+            shown=$(mask "$had")
+            key=$(ask_secret "api key (hidden; enter to keep $shown)")
+            [ -n "$key" ] || key=$had
+        else
+            key=$(ask_secret "api key (hidden; enter to fill in later)")
+        fi
+    else                                # a pipe or a script: keep what is there
+        key=$had
     fi
 
     write_env_file "$url" "$model" "$key"
     [ -n "$key" ] || printf '\nno key yet. Put one in with: %s\n' \
                             "\$EDITOR \"\$(miniagent --env)\"" >&2
-}
-
-
-# The key can be missing even when the file is there - the old template wrote an
-# empty one, and you can skip it above.
-env_has_key() {
-    [ -f "$ENV_FILE" ] || return 1
-    ( set +u; . "$ENV_FILE" >/dev/null 2>&1; [ -n "${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}" ] )
 }
 
 
