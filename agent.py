@@ -19,9 +19,11 @@ AGENT_MODEL for any other /v1/chat/completions server (vLLM, SGLang, Ollama,
 OpenRouter, OpenAI).
 """
 
+import codecs
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -31,6 +33,12 @@ import urllib.request
 from pathlib import Path
 
 import policy as pol_mod
+
+try:                       # raw keyboard input, for reading a bare escape
+    import termios
+    import tty
+except ImportError:        # not POSIX
+    termios = tty = None
 
 
 # ---------------------------------------------------------------- config
@@ -243,6 +251,97 @@ def suggest_rule(tool: str, subject: str) -> str:
     return f"{tool}({pol_mod.escape_glob(subject)})"
 
 
+class Interrupted(Exception):
+    """The user pressed escape at a permission prompt."""
+
+
+def _pending(fd, timeout: float = 0.05) -> bool:
+    return bool(select.select([fd], [], [], timeout)[0])
+
+
+def read_answer(prompt: str):
+    """A short answer from the terminal, or None if escape was pressed.
+
+    `input()` cannot see escape: it is line buffered, so a bare keypress never
+    arrives. Reading the descriptor directly is the only way to notice it -
+    and it has to be `os.read`, because a buffered reader would swallow the
+    rest of an arrow key before select() could tell it apart from escape.
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    if termios is None or not sys.stdin.isatty():
+        try:
+            return input()
+        except EOFError:
+            print()
+            return ""
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    decode = codecs.getincrementaldecoder("utf-8")("replace").decode
+    typed, pushed = [], []
+
+    def getch() -> str:
+        """One character, or "" at end of input. Never a partial one."""
+        if pushed:
+            return pushed.pop()
+        while True:
+            raw = os.read(fd, 1)
+            if not raw:
+                return ""
+            ch = decode(raw)
+            if ch:
+                return ch
+
+    try:
+        # TCSAFLUSH: anything typed before the prompt appeared is dropped
+        # rather than allowed to answer a permission question by accident.
+        tty.setcbreak(fd)
+        while True:
+            ch = getch()
+            if not ch:                        # end of input
+                print()
+                return ""
+            if ch == "\x1b":
+                if not _pending(fd):          # nothing follows: a real escape
+                    print()
+                    return None
+                # An arrow key and friends. Consume exactly the sequence -
+                # draining everything available would eat the line behind it.
+                nxt = getch()
+                if nxt == "[":                # CSI: parameters, then a final byte
+                    while True:
+                        end = getch()
+                        if not end or "@" <= end <= "~":
+                            break
+                elif nxt == "O":              # SS3: one byte follows
+                    getch()
+                elif nxt:
+                    pushed.append(nxt)        # not a sequence we know
+                continue
+            if ch in ("\r", "\n"):
+                print()
+                return "".join(typed)
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x04":
+                print()
+                return ""
+            if ch in ("\x7f", "\b"):
+                if typed:
+                    typed.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if ch < " ":
+                continue
+            typed.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
 def approve(pol, tool: str, args: dict, d) -> bool:
     """Put an `ask` decision to the user.  Returns True to run it once."""
     subject = d.subject or str(args.get(pol_mod.SUBJECT.get(tool, ""), "") or "")
@@ -256,11 +355,11 @@ def approve(pol, tool: str, args: dict, d) -> bool:
     print()
     print("  " + bold(label))
     print(dim(f"  policy: {d.reason}" + (f"  [{d.rule}]" if d.rule else "")))
-    try:
-        ans = input(f"  [y] once   [a] always, save {cyan(rule)}   [N] no > ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
+    ans = read_answer(f"  [y] once   [a] always, save {cyan(rule)}   "
+                      f"[N] no   [esc] stop > ")
+    if ans is None:
+        raise Interrupted
+    ans = ans.strip().lower()
     if ans in ("a", "always"):
         print(dim("  " + pol.remember(GLOBAL_POLICY, rule)))
         return True
@@ -587,6 +686,34 @@ def render(msg: dict) -> None:
         print(f"\n{visible}")
 
 
+STOPPED = ("STOPPED by the user, who pressed escape at the permission prompt. "
+           "Nothing further was run. Wait for their next message; do not carry "
+           "on by yourself and do not retry this call.")
+
+
+def close_dangling(messages: list, why: str) -> int:
+    """Answer any tool_call the turn never got to.
+
+    An interrupted turn otherwise leaves the model's tool_calls unanswered, and
+    the next request is rejected for it - so the session would be dead from the
+    moment the user pressed escape.
+    """
+    answered = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+    added = 0
+    for m in reversed(messages):
+        if m.get("role") != "assistant":
+            continue
+        for c in m.get("tool_calls") or []:
+            if c.get("id") in answered:
+                continue
+            messages.append({"role": "tool", "tool_call_id": c.get("id", ""),
+                             "_name": (c.get("function") or {}).get("name", "?"),
+                             "content": why})
+            added += 1
+        break   # only the newest assistant turn can still be unanswered
+    return added
+
+
 def run_turn(pol, messages: list, max_steps: int) -> None:
     tools = tool_schema()
     for _ in range(max_steps):
@@ -613,7 +740,12 @@ def run_turn(pol, messages: list, max_steps: int) -> None:
                 result = f"ERROR: arguments were not valid JSON: {err}. Send them again as a JSON object."
             else:
                 print(dim(f"  · {name}({_short(json.dumps(args, ensure_ascii=False), 120)})"))
-                result = call_tool(pol, name, args)
+                try:
+                    result = call_tool(pol, name, args)
+                except (Interrupted, KeyboardInterrupt):
+                    close_dangling(messages, STOPPED)
+                    print(yellow("\n[stopped - what would you like to do instead?]"))
+                    return
             if result.startswith("DENIED"):
                 print(red(f"    {result.splitlines()[0]}"))
             # `_name` is ours: handy in the transcript, stripped before sending,
@@ -807,7 +939,9 @@ def main() -> None:
         try:
             run_turn(pol, messages, max_steps)
         except KeyboardInterrupt:
-            print(yellow("\n[interrupted]"))
+            close_dangling(messages, "STOPPED by the user with ctrl-c. Wait for "
+                                     "their next message.")
+            print(yellow("\n[interrupted - what would you like to do instead?]"))
 
 
 if __name__ == "__main__":

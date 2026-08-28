@@ -10,6 +10,7 @@ surviving the round trip - are checked end to end rather than by inspection.
 
 import json
 import os
+import pty
 import shutil
 import subprocess
 import sys
@@ -530,6 +531,110 @@ class Notes(unittest.TestCase):
     def test_no_instruction_file_at_all_is_fine(self):
         self.assertEqual(agent.notes_files(self.root), [])
         self.assertEqual(agent.project_notes(self.root), "")
+
+
+# ---------------------------------------------------------------- escape
+@unittest.skipUnless(agent.termios is not None, "needs a POSIX terminal")
+class Escape(unittest.TestCase):
+    """read_answer talks to the descriptor directly, so drive it with a pty."""
+
+    def drive(self, keys: bytes):
+        master, slave = pty.openpty()
+        saved, box = sys.stdin, {}
+        sys.stdin = os.fdopen(slave, "r")
+        try:
+            def send():
+                time.sleep(0.15)     # setcbreak flushes anything typed earlier
+                os.write(master, keys)
+
+            threading.Thread(target=send, daemon=True).start()
+            worker = threading.Thread(
+                target=lambda: box.update(got=agent.read_answer("")), daemon=True)
+            worker.start()
+            worker.join(5)
+            self.assertFalse(worker.is_alive(), "read_answer never returned")
+            return box.get("got")
+        finally:
+            sys.stdin.close()
+            sys.stdin = saved
+            os.close(master)
+
+    def test_a_bare_escape_is_reported_as_such(self):
+        self.assertIsNone(self.drive(b"\x1b"))
+
+    def test_an_ordinary_answer_still_comes_back(self):
+        self.assertEqual(self.drive(b"y\r"), "y")
+        self.assertEqual(self.drive(b"always\n"), "always")
+
+    def test_an_arrow_key_is_not_mistaken_for_escape(self):
+        # and, just as important, consuming it must not eat the line behind it
+        self.assertEqual(self.drive(b"\x1b[Ayes\r"), "yes")
+        self.assertEqual(self.drive(b"\x1bOPno\r"), "no")
+
+    def test_editing_and_end_of_input(self):
+        self.assertEqual(self.drive(b"ab\x7fc\r"), "ac")
+        self.assertEqual(self.drive(b"\x04"), "")
+        self.assertEqual(self.drive("\u00e5j\r".encode()), "\u00e5j")
+
+
+class StoppedTurn(unittest.TestCase):
+    def setUp(self):
+        RESPONSES.clear()
+        REQUESTS.clear()
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        agent.ROOTS[:] = [self.root]
+        self._approve = agent.approve
+
+    def tearDown(self):
+        agent.approve = self._approve
+
+    def test_escape_ends_the_turn_and_leaves_a_usable_transcript(self):
+        RESPONSES.append({"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {
+                "name": "write_file", "arguments": '{"path": "a", "content": "x"}'}},
+            {"id": "c2", "type": "function", "function": {
+                "name": "write_file", "arguments": '{"path": "b", "content": "y"}'}}]})
+        RESPONSES.append({"role": "assistant", "content": "ok, waiting"})
+
+        def escape(*_a):
+            raise agent.Interrupted
+
+        agent.approve = escape
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        agent.run_turn(make_policy(), msgs, 5)
+
+        self.assertEqual(len(REQUESTS), 1, "the turn kept going after escape")
+        self.assertFalse((self.root / "a").exists())
+        self.assertFalse((self.root / "b").exists())
+
+        # every tool_call must have an answer or the next request is rejected
+        wired = agent.wire(msgs)
+        asked = {c["id"] for m in wired for c in m.get("tool_calls") or []}
+        answered = {m["tool_call_id"] for m in wired if m["role"] == "tool"}
+        self.assertEqual(asked, answered)
+        self.assertTrue(all("STOPPED" in m["content"]
+                            for m in wired if m["role"] == "tool"))
+
+    def test_the_session_carries_on_afterwards(self):
+        RESPONSES.append({"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {
+                "name": "write_file", "arguments": '{"path": "a", "content": "x"}'}}]})
+        RESPONSES.append({"role": "assistant", "content": "understood"})
+        agent.approve = lambda *_a: (_ for _ in ()).throw(agent.Interrupted)
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        agent.run_turn(make_policy(), msgs, 5)
+
+        agent.approve = self._approve
+        msgs.append({"role": "user", "content": "do something else instead"})
+        agent.run_turn(make_policy(), msgs, 5)
+        self.assertEqual(msgs[-1]["content"], "understood")
+
+    def test_close_dangling_is_a_no_op_when_nothing_is_outstanding(self):
+        msgs = [{"role": "assistant", "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "done"}]
+        self.assertEqual(agent.close_dangling(msgs, "why"), 0)
+        self.assertEqual(len(msgs), 2)
 
 
 # ---------------------------------------------------------------- wrapper

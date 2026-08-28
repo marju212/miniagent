@@ -124,12 +124,29 @@ edit asks again. Cloning a repo cannot widen what the agent may do.
 ```
   bash: npm install lodash
   policy: no rule matched (default_action)
-  [y] once   [a] always, save bash(npm install*)   [N] no >
+  [y] once   [a] always, save bash(npm install*)   [N] no   [esc] stop >
 ```
 
 `a` appends the rule to your global file and it takes effect immediately. A
 `deny` is never offered — the model is told so, and told not to route around
 it. `AGENT_YOLO=1` auto-approves every `ask`; it still cannot touch a `deny`.
+
+**Escape** stops the whole turn rather than just refusing that one call, and
+hands you back the prompt to say what you want instead. `n` is narrower: it
+refuses this call and lets the agent carry on with the rest of the task.
+`ctrl-c` does what escape does.
+
+```
+  · write_file({"path": "src/db.py", ...})
+
+[stopped - what would you like to do instead?]
+
+> leave db.py alone, put it in a new file
+```
+
+An interrupted turn still leaves an answer for every tool call the model made,
+so the conversation survives the interruption instead of being rejected by the
+API on the next message.
 
 ## Tuned for MiniMax-M2.5
 
