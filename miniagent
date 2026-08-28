@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+#
+# miniagent - loads your settings, then runs the agent.
+#
+# Your exports live in ~/.miniagent/env, next to policy.json and trusted.json.
+# Anything already set in your shell wins over that file, so a one-off
+#
+#     AGENT_MODEL=MiniMax-M2.5-highspeed miniagent ~/code/proj
+#
+# still does what it says.
+#
+set -euo pipefail
+
+CONFIG_DIR="${MINIAGENT_HOME:-$HOME/.miniagent}"
+ENV_FILE="${MINIAGENT_ENV:-$CONFIG_DIR/env}"
+PYTHON="${MINIAGENT_PYTHON:-python3}"
+
+# Where this script really lives, following the symlink `--install` leaves on
+# PATH.  `readlink -f` is not portable, so walk the chain by hand.
+SELF=${BASH_SOURCE[0]}
+case $SELF in
+    /*) ;;
+    # absolute first, or `--install` would link to a relative path from $bindir
+    *) SELF=$(cd -P "$(dirname "$SELF")" && pwd)/$(basename "$SELF") ;;
+esac
+while [ -L "$SELF" ]; do
+    target=$(readlink "$SELF")
+    case $target in
+        /*) SELF=$target ;;
+        *)  SELF=$(cd -P "$(dirname "$SELF")" && pwd)/$target ;;
+    esac
+done
+HERE=$(cd -P "$(dirname "$SELF")" && pwd)
+
+die() { printf 'miniagent: %s\n' "$*" >&2; exit 1; }
+
+[ -f "$HERE/agent.py" ] || die "cannot find agent.py next to $SELF"
+
+
+usage() {
+    cat <<'EOF'
+usage: miniagent [wrapper option] | [agent option] [directory]
+
+wrapper options
+  --install [bindir]   symlink onto your PATH (default ~/.local/bin) and
+                       create the settings file if it is missing
+  --init-env           create ~/.miniagent/env from the template
+  --env                print the path of the settings file
+                       (edit it with: $EDITOR "$(miniagent --env)")
+
+everything else is passed straight to agent.py:
+EOF
+}
+
+
+write_env_template() {
+    mkdir -p "$(dirname "$ENV_FILE")"
+    ( umask 077; cat > "$ENV_FILE" <<'EOF'
+# miniagent settings.  Sourced by the `miniagent` wrapper as shell, so command
+# substitution works.  Anything already set in your shell wins over what is
+# here.  Keep it private - it holds your API key.
+
+export AGENT_API_KEY=                            # MiniMax key (or MINIMAX_API_KEY)
+export AGENT_MODEL=MiniMax-M2.5                  # or MiniMax-M2.5-highspeed
+export AGENT_BASE_URL=https://api.minimax.io/v1  # api.minimaxi.com/v1 in China
+
+# A key out of a password manager works too:
+# export AGENT_API_KEY=$(pass show minimax/api)
+
+# The settings MiniMax measured M2.x at.  Leave them be unless you have a
+# reason - drifting off them is the usual cause of flaky tool calls.
+# export AGENT_TEMPERATURE=1.0
+# export AGENT_TOP_P=0.95
+# export AGENT_TOP_K=40
+# export AGENT_MAX_TOKENS=16384
+
+# export AGENT_THINKING=1     # show the model's reasoning
+# export AGENT_YOLO=1         # auto-approve every `ask` (a `deny` still holds)
+# export AGENT_POLICY=        # an extra rule file for every run
+EOF
+    )
+    chmod 600 "$ENV_FILE"
+}
+
+
+shell_rc() {
+    local sh=${SHELL:-/bin/sh}       # $SHELL is not guaranteed under `set -u`
+    case ${sh##*/} in
+        zsh)  printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash) [ -f "$HOME/.bash_profile" ] && [ ! -f "$HOME/.bashrc" ] \
+                  && printf '%s\n' "$HOME/.bash_profile" \
+                  || printf '%s\n' "$HOME/.bashrc" ;;
+        *)    printf '%s\n' "$HOME/.profile" ;;
+    esac
+}
+
+
+install_self() {
+    local bindir=${1:-$HOME/.local/bin}
+    local link=$bindir/miniagent
+    mkdir -p "$bindir"
+
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        die "$link exists and is not a symlink; move it out of the way first"
+    fi
+    ln -sfn "$SELF" "$link"
+    printf 'linked  %s -> %s\n' "$link" "$SELF"
+
+    if [ -f "$ENV_FILE" ]; then
+        printf 'kept    %s\n' "$ENV_FILE"
+    else
+        write_env_template
+        printf 'wrote   %s   <- put your API key here\n' "$ENV_FILE"
+    fi
+
+    case ":$PATH:" in
+        *":$bindir:"*)
+            printf 'ready   %s is on your PATH\n' "$bindir"
+            return ;;
+    esac
+
+    local rc line
+    rc=$(shell_rc)
+    line="export PATH=\"$bindir:\$PATH\""
+    printf '\n%s is not on your PATH. Add this to %s:\n    %s\n' "$bindir" "$rc" "$line"
+    if [ -t 0 ] && [ -t 1 ]; then
+        local answer
+        read -r -p "add it now? [y/N] " answer
+        case $answer in
+            y|Y|yes)
+                printf '\n# added by miniagent --install\n%s\n' "$line" >> "$rc"
+                printf 'added to %s; run: source %s\n' "$rc" "$rc" ;;
+        esac
+    fi
+}
+
+
+case ${1:-} in
+    --install)  shift; install_self "${1:-}"; exit 0 ;;
+    --init-env) [ -f "$ENV_FILE" ] && die "$ENV_FILE already exists; edit it instead"
+                write_env_template; printf 'wrote %s\n' "$ENV_FILE"; exit 0 ;;
+    --env)      printf '%s\n' "$ENV_FILE"; exit 0 ;;
+    -h|--help)  usage; echo; exec "$PYTHON" "$HERE/agent.py" --help ;;
+esac
+
+
+# ---- settings ------------------------------------------------------------
+if [ -n "${MINIAGENT_ENV:-}" ] && [ ! -f "$ENV_FILE" ]; then
+    die "MINIAGENT_ENV=$ENV_FILE does not exist"
+fi
+
+if [ -f "$ENV_FILE" ]; then
+    perms=$(stat -c %a "$ENV_FILE" 2>/dev/null || stat -f %Lp "$ENV_FILE" 2>/dev/null || echo 600)
+    case $perms in
+        *00) ;;
+        *) printf 'miniagent: %s is readable by others; chmod 600 it\n' "$ENV_FILE" >&2 ;;
+    esac
+
+    # What the caller set explicitly outranks the file, so remember it first.
+    declare -A preset=()
+    while read -r name; do
+        [ -n "$name" ] && preset[$name]=${!name}
+    done < <(compgen -v 2>/dev/null | grep -E '^(AGENT_|MINIMAX_)' || true)
+
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+
+    if [ "${#preset[@]}" -gt 0 ]; then
+        for name in "${!preset[@]}"; do export "$name=${preset[$name]}"; done
+    fi
+fi
+
+exec "$PYTHON" "$HERE/agent.py" "$@"

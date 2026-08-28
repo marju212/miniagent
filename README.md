@@ -9,16 +9,48 @@ put to the policy first and comes back **allow / ask / deny**.
 No dependencies outside the standard library.
 
 ```bash
-export AGENT_API_KEY=...                     # or MINIMAX_API_KEY
-python3 agent.py --init-policy               # write the global rule file
-python3 agent.py ~/code/my-project           # interactive
-python3 agent.py -p "fix the failing test" ~/code/my-project
+./miniagent --install                        # onto PATH, seeds the settings file
+$EDITOR "$(miniagent --env)"                 # put your API key in
+
+miniagent --init-policy                      # write the global rule file
+miniagent ~/code/my-project                  # interactive
+miniagent -p "fix the failing test" ~/code/my-project
 ```
+
+`--install` symlinks the `miniagent` wrapper into `~/.local/bin`, and offers to
+put that on your `PATH` if it is not already. Nothing stops you calling
+`python3 agent.py ...` directly instead.
 
 Defaults point at MiniMax's OpenAI-compatible endpoint
 (`https://api.minimax.io/v1`, model `MiniMax-M2.5`). Set `AGENT_BASE_URL` and
 `AGENT_MODEL` for any other `/v1/chat/completions` server — vLLM, SGLang,
 Ollama, OpenRouter, OpenAI.
+
+## Settings
+
+`~/.miniagent/env`, next to `policy.json`. The wrapper sources it as shell, so
+a key out of a password manager works:
+
+```bash
+export AGENT_API_KEY=$(pass show minimax/api)
+export AGENT_MODEL=MiniMax-M2.5
+```
+
+It is created `0600` and you are told if that ever stops being true. Anything
+already set in your shell **wins** over the file, so a one-off still does what
+it says:
+
+```bash
+AGENT_MODEL=MiniMax-M2.5-highspeed miniagent ~/code/proj
+```
+
+| | |
+|---|---|
+| `miniagent --install [bindir]` | symlink onto PATH, seed the settings file |
+| `miniagent --init-env` | create the settings file from the template |
+| `miniagent --env` | print its path |
+| `MINIAGENT_ENV` | use a different settings file |
+| `MINIAGENT_PYTHON` | use a different interpreter |
 
 ## The rule file
 
@@ -100,8 +132,8 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 ```
 
 ```bash
-python3 agent.py --rules                    # everything in force
-python3 agent.py --check bash 'git push'    # explain one decision
+miniagent --rules                    # everything in force
+miniagent --check bash 'git push'    # explain one decision
 ```
 
 ## Tools
@@ -132,6 +164,7 @@ prompt.
 python3 -m unittest test_miniagent -v
 ```
 
-The agent loop is exercised against a stub `/v1/chat/completions` server, so the
-things that matter — the policy gate refusing a call, and the reasoning
-surviving the round trip — are checked end to end.
+The agent loop is exercised against a stub `/v1/chat/completions` server and the
+wrapper is run as a real subprocess, so the things that matter — the policy gate
+refusing a call, the reasoning surviving the round trip, and your shell
+outranking the settings file — are checked end to end.

@@ -10,6 +10,8 @@ surviving the round trip - are checked end to end rather than by inspection.
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -420,6 +422,93 @@ class Loop(unittest.TestCase):
         msgs = self.start()
         agent.run_turn(make_policy(allow=["read_file(**)"]), msgs, 3)
         self.assertEqual(len(REQUESTS), 3)
+
+
+# ---------------------------------------------------------------- wrapper
+WRAPPER = HERE / "miniagent"
+
+
+def run_wrapper(*args, home, env=None):
+    """The wrapper in a shell of its own, with nothing inherited by accident."""
+    e = {"PATH": os.environ["PATH"], "HOME": str(home), "SHELL": "/bin/bash"}
+    e.update(env or {})
+    return subprocess.run([str(WRAPPER), *args], capture_output=True, text=True, env=e)
+
+
+@unittest.skipUnless(WRAPPER.is_file() and shutil.which("bash"), "needs bash")
+class Wrapper(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp()).resolve()
+        (self.home / ".miniagent").mkdir()
+        self.env_file = self.home / ".miniagent" / "env"
+        self.proj = Path(tempfile.mkdtemp()).resolve()
+
+    def write_env(self, text: str) -> None:
+        self.env_file.write_text(text, encoding="utf-8")
+        self.env_file.chmod(0o600)
+
+    def test_env_reports_where_the_settings_live(self):
+        r = run_wrapper("--env", home=self.home)
+        self.assertEqual(r.stdout.strip(), str(self.env_file))
+
+    def test_init_env_writes_a_private_file_and_will_not_clobber_it(self):
+        r = run_wrapper("--init-env", home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
+        again = run_wrapper("--init-env", home=self.home)
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("already exists", again.stderr)
+
+    def test_install_leaves_an_absolute_symlink_that_still_finds_agent_py(self):
+        bindir = self.home / "bin"
+        r = run_wrapper("--install", str(bindir), home=self.home,
+                        env={"PATH": f"{bindir}:{os.environ['PATH']}"})
+        link = bindir / "miniagent"
+        self.assertTrue(link.is_symlink(), r.stdout + r.stderr)
+        self.assertTrue(os.readlink(link).startswith("/"))   # not `./miniagent`
+        self.assertEqual(link.resolve(), WRAPPER.resolve())
+        self.assertTrue(self.env_file.exists())
+        through = subprocess.run(
+            [str(link), "--check", "bash", "sudo ls", str(self.proj)],
+            capture_output=True, text=True,
+            env={"PATH": os.environ["PATH"], "HOME": str(self.home)})
+        self.assertIn("DENY", through.stdout, through.stderr)
+
+    def test_the_settings_file_is_sourced(self):
+        rules = self.home / "extra.json"
+        rules.write_text('{"allow": ["bash(pytest*)"]}', encoding="utf-8")
+        self.write_env(f"export AGENT_POLICY={rules}\n")
+        r = run_wrapper("--check", "bash", "pytest -q", str(self.proj), home=self.home)
+        self.assertIn("ALLOW", r.stdout, r.stderr)
+
+    def test_command_substitution_works_in_the_settings_file(self):
+        self.write_env("export AGENT_MODEL=$(echo from-a-vault)\n")
+        r = run_wrapper("-p", "hi", str(self.proj), home=self.home,
+                        env={"AGENT_BASE_URL": "http://127.0.0.1:1/v1",
+                             "AGENT_RETRIES": "1"})
+        self.assertIn("model from-a-vault", r.stdout)
+
+    def test_the_callers_own_environment_outranks_the_file(self):
+        loose = self.home / "loose.json"
+        loose.write_text('{"allow": ["bash(pytest*)"]}', encoding="utf-8")
+        tight = self.home / "tight.json"
+        tight.write_text('{"deny": ["bash(pytest*)"]}', encoding="utf-8")
+        self.write_env(f"export AGENT_POLICY={loose}\n")
+        r = run_wrapper("--check", "bash", "pytest -q", str(self.proj),
+                        home=self.home, env={"AGENT_POLICY": str(tight)})
+        self.assertIn("DENY", r.stdout, r.stderr)
+
+    def test_a_settings_file_that_was_asked_for_but_is_missing_is_an_error(self):
+        r = run_wrapper("--check", "bash", "ls", str(self.proj), home=self.home,
+                        env={"MINIAGENT_ENV": str(self.home / "nope")})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not exist", r.stderr)
+
+    def test_a_world_readable_settings_file_is_called_out(self):
+        self.write_env("export AGENT_MODEL=x\n")
+        self.env_file.chmod(0o644)
+        r = run_wrapper("--rules", str(self.proj), home=self.home)
+        self.assertIn("readable by others", r.stderr)
 
 
 if __name__ == "__main__":
