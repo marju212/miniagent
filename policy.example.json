@@ -1,0 +1,54 @@
+{
+  "_readme": [
+    "Copy to ~/.miniagent/policy.json (or run: python3 agent.py --init-policy).",
+    "A rule is tool(pattern), or a bare tool name to cover every call to it.",
+    "Order of judgement: deny > ask > allow > default_action. Deny always wins.",
+    "Path patterns are globs where * stops at / and ** does not.",
+    "Command patterns are globs where * matches anything, including /.",
+    "Compound commands are split on && || ; | & and each part is judged alone.",
+    "Layers only ever ADD rules: built-in defaults, then this file, then",
+    "<project>/.miniagent/policy.json, then $AGENT_POLICY. The project file is",
+    "read for its restrictions only until you vouch for it once."
+  ],
+
+  "version": 1,
+  "default_action": "ask",
+
+  "deny": [
+    "read_file(**/.env)",
+    "read_file(**/secrets/**)",
+    "bash(git push --force*)",
+    "bash(docker system prune*)"
+  ],
+
+  "ask": [
+    "bash(git commit*)",
+    "bash(git push*)",
+    "bash(terraform apply*)"
+  ],
+
+  "allow": [
+    "read_file(**)",
+    "write_file(src/**)",
+    "edit_file(src/**)",
+    "bash(pytest*)",
+    "bash(ruff *)",
+    "bash(cargo test*)",
+    "bash(go test *)"
+  ],
+
+  "limits": {
+    "max_steps": 40,
+    "max_output_chars": 20000,
+    "bash_timeout_max": 300,
+    "max_write_bytes": 1000000
+  },
+
+  "bash": {
+    "split_operators": true,
+    "strict_syntax": true
+  },
+
+  "allowed_roots": [],
+  "persist_approvals": true
+}
