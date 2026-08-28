@@ -451,11 +451,11 @@ class Wrapper(unittest.TestCase):
         r = run_wrapper("--env", home=self.home)
         self.assertEqual(r.stdout.strip(), str(self.env_file))
 
-    def test_init_env_writes_a_private_file_and_will_not_clobber_it(self):
-        r = run_wrapper("--init-env", home=self.home)
+    def test_init_writes_a_private_file_and_will_not_clobber_it(self):
+        r = run_wrapper("--init", home=self.home)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
-        again = run_wrapper("--init-env", home=self.home)
+        again = run_wrapper("--init", home=self.home)
         self.assertNotEqual(again.returncode, 0)
         self.assertIn("already exists", again.stderr)
 

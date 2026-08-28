@@ -44,7 +44,7 @@ usage: miniagent [wrapper option] | [agent option] [directory]
 wrapper options
   --install [bindir]   symlink onto your PATH (default ~/.local/bin) and
                        create the settings file if it is missing
-  --init-env           create ~/.miniagent/env from the template
+  --init               create ~/.miniagent/env from the template
   --env                print the path of the settings file
                        (edit it with: $EDITOR "$(miniagent --env)")
 
@@ -137,7 +137,7 @@ install_self() {
 
 case ${1:-} in
     --install)  shift; install_self "${1:-}"; exit 0 ;;
-    --init-env) [ -f "$ENV_FILE" ] && die "$ENV_FILE already exists; edit it instead"
+    --init)     [ -f "$ENV_FILE" ] && die "$ENV_FILE already exists; edit it instead"
                 write_env_template; printf 'wrote %s\n' "$ENV_FILE"; exit 0 ;;
     --env)      printf '%s\n' "$ENV_FILE"; exit 0 ;;
     -h|--help)  usage; echo; exec "$PYTHON" "$HERE/agent.py" --help ;;

@@ -47,7 +47,7 @@ AGENT_MODEL=MiniMax-M2.5-highspeed miniagent ~/code/proj
 | | |
 |---|---|
 | `miniagent --install [bindir]` | symlink onto PATH, seed the settings file |
-| `miniagent --init-env` | create the settings file from the template |
+| `miniagent --init` | create the settings file from the template |
 | `miniagent --env` | print its path |
 | `MINIAGENT_ENV` | use a different settings file |
 | `MINIAGENT_PYTHON` | use a different interpreter |
