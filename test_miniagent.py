@@ -39,18 +39,25 @@ os.environ.pop("AGENT_YOLO", None)
 
 RESPONSES: list = []   # assistant messages the stub hands back, in order
 REQUESTS: list = []    # request bodies the agent sent
+FAULTS: list = []      # (status, body) pairs to answer with first, in order
 
 
 class _Stub(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         REQUESTS.append(body)
-        msg = RESPONSES.pop(0) if RESPONSES else {"role": "assistant", "content": "done"}
-        out = json.dumps({
-            "choices": [{"message": msg, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-        }).encode()
-        self.send_response(200)
+        if FAULTS:
+            status, doc = FAULTS.pop(0)
+            out = doc.encode() if isinstance(doc, str) else json.dumps(doc).encode()
+        else:
+            status = 200
+            msg = RESPONSES.pop(0) if RESPONSES else {"role": "assistant",
+                                                      "content": "done"}
+            out = json.dumps({
+                "choices": [{"message": msg, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
@@ -67,6 +74,7 @@ os.environ["AGENT_API_KEY"] = "test-key"
 os.environ["AGENT_MODEL"] = "MiniMax-M2.5"
 
 import agent          # noqa: E402
+import ui             # noqa: E402
 import policy         # noqa: E402
 
 
@@ -792,6 +800,188 @@ class Approving(unittest.TestCase):
                                                self.confirm()))
 
 
+# ---------------------------------------------------------------- failures
+class Recoverable(unittest.TestCase):
+    """An API failure must cost you the request, never the conversation."""
+
+    def setUp(self):
+        RESPONSES.clear()
+        REQUESTS.clear()
+        FAULTS.clear()
+        self.addCleanup(FAULTS.clear)
+
+    def ask(self):
+        return agent.llm([{"role": "user", "content": "hi"}], [])
+
+    def test_a_rejected_key_is_a_sentence_not_an_exit(self):
+        FAULTS.append((401, {"error": {"message": "Invalid API key provided"}}))
+        with self.assertRaises(agent.ApiError) as caught:
+            self.ask()
+        self.assertIn("key was rejected", str(caught.exception))
+        self.assertEqual(caught.exception.code, 401)
+
+    def test_a_full_context_points_at_the_command_that_fixes_it(self):
+        FAULTS.append((400, {"error": {"message":
+                                       "This model's maximum context length is 200000"}}))
+        with self.assertRaises(agent.ApiError) as caught:
+            self.ask()
+        self.assertIn("/compact", str(caught.exception))
+
+    def test_running_out_of_credit_says_so(self):
+        FAULTS.append((402, {"error": {"message": "insufficient balance"}}))
+        with self.assertRaises(agent.ApiError) as caught:
+            self.ask()
+        self.assertIn("credit", str(caught.exception))
+
+    def test_a_gateway_answering_with_a_list_does_not_traceback(self):
+        FAULTS.append((200, [1, 2, 3]))
+        with self.assertRaises(agent.ApiError) as caught:
+            self.ask()
+        self.assertIn("not an object", str(caught.exception))
+
+    def test_a_login_page_where_the_api_should_be_says_what_it_got(self):
+        # Retried first: a body can also be cut short in transit.
+        FAULTS.extend([(200, "<html>sign in</html>")] * 2)
+        with _patch(agent, "RETRIES", 1):
+            with self.assertRaises(agent.ApiError) as caught:
+                self.ask()
+        self.assertIn("did not return JSON", str(caught.exception))
+
+    def test_minimax_reports_a_bad_key_inside_a_200_and_is_still_understood(self):
+        FAULTS.append((200, {"base_resp": {"status_code": 1004,
+                                           "status_msg": "invalid api key"}}))
+        with self.assertRaises(agent.ApiError) as caught:
+            self.ask()
+        self.assertIn("key was rejected", str(caught.exception))
+
+    def test_no_failure_path_exits_the_process(self):
+        for status, doc in ((401, {}), (500, {}), (200, [1]), (200, "nope"),
+                            (200, {"base_resp": {"status_code": 1008}}),
+                            (200, {"choices": []})):
+            with self.subTest(status=status, doc=doc):
+                FAULTS.clear()
+                FAULTS.extend([(status, doc)] * 8)
+                with _patch(agent, "RETRIES", 1):
+                    with self.assertRaises(agent.ApiError):
+                        self.ask()
+
+    def test_the_transcript_survives_a_failed_turn(self):
+        FAULTS.append((500, {"error": "boom"}))
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        with _patch(agent, "RETRIES", 1):
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent.turn(make_policy(), msgs, 5)
+        # still exactly what we started with, and sendable
+        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+        RESPONSES.append({"role": "assistant", "content": "second time lucky"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.run_turn(make_policy(), msgs, 5)
+        self.assertEqual(msgs[-1]["content"], "second time lucky")
+
+
+# ---------------------------------------------------------------- what you see
+class Showing(unittest.TestCase):
+    """What a tool call leaves on the screen."""
+
+    def test_a_diff_counts_the_whole_change_even_when_it_shows_part_of_it(self):
+        before = "\n".join(f"line {i}" for i in range(40))
+        after = before.replace("line 5", "CHANGED").replace("line 30", "ALSO")
+        out = "\n".join(ui.diff_lines(before, after, max_lines=4))
+        self.assertIn("more lines", out)
+        self.assertIn("+2 -2", out)            # counted over the whole diff
+
+    def test_a_removed_comment_line_is_not_mistaken_for_a_diff_header(self):
+        # `-- x` removed reads as `--- x`, which a prefix filter would eat -
+        # and the preview would then claim the edit changed nothing.
+        before = "SELECT 1;\n-- keep this secret\nSELECT 2;\n"
+        after = "SELECT 1;\nSELECT 2;\n"
+        out = "\n".join(ui.diff_lines(before, after))
+        self.assertIn("keep this secret", out)
+        self.assertIn("+0 -1", out)
+        self.assertEqual(agent.counts(before, after), "+0 -1")
+
+    def test_an_added_line_starting_with_plusses_is_counted(self):
+        before = "a\n"
+        after = "a\n++ x\n"
+        self.assertEqual(agent.counts(before, after), "+1 -0")
+        self.assertIn("++ x", "\n".join(ui.diff_lines(before, after)))
+
+    def test_a_tiny_result_budget_shows_less_not_more(self):
+        result = "exit=0\n--- stdout ---\n" + "\n".join(str(i) for i in range(20))
+        for budget in (1, 2, 3):
+            with self.subTest(budget=budget):
+                out = ui.tool_result("bash", result, 0.0, budget)
+                self.assertLessEqual(len(out), budget + 1, out)
+
+    def test_an_unchanged_file_says_so_rather_than_showing_nothing(self):
+        self.assertIn("no change", "".join(ui.diff_lines("a\n", "a\n")))
+
+    def test_a_call_is_named_the_way_the_permission_prompt_names_it(self):
+        self.assertIn("bash(pytest -q)", ui.tool_line("bash", {"cmd": "pytest -q"}, "cmd"))
+
+    def test_a_failing_command_shows_its_status_and_keeps_the_tail(self):
+        result = "exit=2\n--- stdout ---\na\nb\nc\n--- stderr ---\nboom"
+        out = "\n".join(ui.tool_result("bash", result, 0.0, 6))
+        self.assertIn("exit 2", out)
+        self.assertIn("boom", out)             # the reason is at the end
+
+    def test_a_result_can_be_switched_off_entirely(self):
+        self.assertEqual(ui.tool_result("bash", "exit=0\n--- stdout ---\nx", 0.0, 0), [])
+
+    def test_an_edit_reports_what_it_changed(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "f.txt").write_text("a\nb\n", encoding="utf-8")
+        with _patch(agent, "ROOTS", [root]):
+            self.assertIn("+1 -1", agent.t_edit("f.txt", "b", "B"))
+            self.assertIn("new file", agent.t_write("g.txt", "x\n"))
+            self.assertIn("+1 -0", agent.t_write("f.txt", "a\nB\nc\n"))
+
+    def test_a_write_is_previewed_before_it_is_approved(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "f.txt").write_text("a\nb\n", encoding="utf-8")
+        with _patch(agent, "ROOTS", [root]):
+            got = agent.proposed_change("write_file", {"path": "f.txt",
+                                                       "content": "a\nB\n"})
+            self.assertEqual(got[1], "a\nb\n")
+            self.assertEqual(got[2], "a\nB\n")
+            self.assertIsNone(agent.proposed_change("bash", {"cmd": "ls"}))
+
+    def test_an_ambiguous_edit_is_not_previewed(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "f.txt").write_text("x\nx\n", encoding="utf-8")
+        with _patch(agent, "ROOTS", [root]):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertIsNone(agent.proposed_change(
+                    "edit_file", {"path": "f.txt", "old": "x", "new": "y"}))
+            self.assertIn("matches 2 places", out.getvalue())
+
+    def test_the_clock_starts_after_the_permission_prompt(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        pol = make_policy(default_action="ask")
+
+        def slow_yes(*_a):
+            time.sleep(0.4)                 # the user, thinking
+            return True
+
+        with _patch(agent, "ROOTS", [root]), _patch(agent, "approve", slow_yes):
+            _result, took = agent.call_tool(pol, "write_file",
+                                            {"path": "f.txt", "content": "x\n"})
+        self.assertLess(took, 0.3, "the wait at the prompt was counted as work")
+
+    def test_a_preview_never_writes_the_file(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "f.txt").write_text("a\n", encoding="utf-8")
+        with _patch(agent, "ROOTS", [root]):
+            agent.proposed_change("write_file", {"path": "f.txt", "content": "z\n"})
+        self.assertEqual((root / "f.txt").read_text(encoding="utf-8"), "a\n")
+
+    def test_a_path_outside_the_sandbox_is_simply_not_previewed(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        with _patch(agent, "ROOTS", [root]):
+            self.assertIsNone(agent.proposed_change(
+                "write_file", {"path": "../../etc/passwd", "content": "x"}))
+
+
 # ---------------------------------------------------------------- escape
 @unittest.skipUnless(agent.termios is not None, "needs a POSIX terminal")
 class Escape(unittest.TestCase):
@@ -1041,14 +1231,14 @@ class ShellEscapeMishaps(unittest.TestCase):
 class Bar(unittest.TestCase):
     def setUp(self):
         self.bar = agent.StatusBar()
-        self._tty = agent._TTY
+        self._tty = agent.ui._TTY
         self._term = os.environ.get("TERM")
         self._winch = signal.getsignal(signal.SIGWINCH)
         os.environ["TERM"] = "xterm"
         os.environ.pop("AGENT_STATUS", None)
 
     def tearDown(self):
-        agent._TTY = self._tty
+        agent.ui._TTY = self._tty
         signal.signal(signal.SIGWINCH, self._winch)
         if self._term is None:
             os.environ.pop("TERM", None)
@@ -1063,7 +1253,7 @@ class Bar(unittest.TestCase):
         return ok, out.getvalue()
 
     def test_it_reserves_the_last_row_draws_in_grey_and_gives_it_back(self):
-        agent._TTY = True
+        agent.ui._TTY = True
         rows = shutil.get_terminal_size().lines
         ok, out = self.drive()
         self.assertTrue(ok)
@@ -1075,15 +1265,15 @@ class Bar(unittest.TestCase):
         self.assertFalse(self.bar.on)
 
     def test_it_saves_and_restores_the_cursor_around_every_move(self):
-        agent._TTY = True
+        agent.ui._TTY = True
         _ok, out = self.drive()
         self.assertEqual(out.count("\0337"), out.count("\0338"))
 
     def test_it_stays_out_of_the_way_where_it_cannot_work(self):
-        for why, setup in (("no terminal", lambda: setattr(agent, "_TTY", False)),
+        for why, setup in (("no terminal", lambda: setattr(agent.ui, "_TTY", False)),
                            ("dumb terminal", lambda: os.environ.__setitem__("TERM", "dumb")),
                            ("switched off", lambda: os.environ.__setitem__("AGENT_STATUS", "off"))):
-            agent._TTY = True
+            agent.ui._TTY = True
             os.environ["TERM"] = "xterm"
             os.environ.pop("AGENT_STATUS", None)
             setup()
@@ -1091,7 +1281,7 @@ class Bar(unittest.TestCase):
         os.environ.pop("AGENT_STATUS", None)
 
     def test_a_long_status_is_cut_to_the_terminal_width(self):
-        agent._TTY = True
+        agent.ui._TTY = True
         cols = shutil.get_terminal_size().columns
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.bar.install()
@@ -1105,7 +1295,7 @@ class Bar(unittest.TestCase):
     def test_a_resize_only_sets_a_flag_and_the_next_draw_recuts_the_region(self):
         # writing escape sequences from a signal handler can re-enter a
         # half-finished stdout write, and DECSC has one save slot per terminal
-        agent._TTY = True
+        agent.ui._TTY = True
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.bar.install()
             before = out.getvalue()
@@ -1119,7 +1309,7 @@ class Bar(unittest.TestCase):
         self.assertFalse(self.bar.stale)
 
     def test_a_terminal_too_narrow_to_truncate_into_is_still_respected(self):
-        agent._TTY = True
+        agent.ui._TTY = True
         saved = os.environ.get("COLUMNS")
         os.environ["COLUMNS"] = "4"
         try:
@@ -1247,7 +1437,7 @@ class History(unittest.TestCase):
     def test_the_prompt_marks_its_colour_codes_as_zero_width(self):
         # readline measures the prompt to know where to redraw an edited line
         p = agent.prompt_text("> ")
-        if agent._TTY:
+        if agent.ui._TTY:
             self.assertTrue(p.startswith("\001"))
             self.assertEqual(p.count("\001"), p.count("\002"))
         self.assertIn("> ", p)
@@ -1297,6 +1487,67 @@ class ArrowKeys(unittest.TestCase):
         asked = [[m for m in r["messages"] if m["role"] == "user"][-1]["content"]
                  for r in REQUESTS]
         self.assertEqual(asked, ["say hi", "say hi"], self.buf)
+
+
+class Leaving(unittest.TestCase):
+    """Ctrl-c at the prompt, and what a signal leaves behind."""
+
+    def read_until(self, master, pattern, seconds=20):
+        end = time.time() + seconds
+        while time.time() < end:
+            if select.select([master], [], [], 0.2)[0]:
+                self.buf += os.read(master, 4096).decode("utf-8", "replace")
+                if re.search(pattern, self.buf):
+                    return True
+        return False
+
+    def start(self):
+        home, proj = tempfile.mkdtemp(), tempfile.mkdtemp()
+        master, slave = pty.openpty()
+        self.buf = ""
+        env = {"PATH": os.environ["PATH"], "HOME": home, "TERM": "xterm",
+               "AGENT_BASE_URL": os.environ["AGENT_BASE_URL"], "AGENT_API_KEY": "x"}
+        proc = subprocess.Popen([sys.executable, str(HERE / "agent.py"), proj],
+                                stdin=slave, stdout=slave, stderr=slave, env=env)
+        os.close(slave)
+        self.addCleanup(proc.kill)
+        self.addCleanup(os.close, master)
+        return proc, master
+
+    def test_one_ctrl_c_keeps_the_session_and_two_leave(self):
+        proc, master = self.start()
+        self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+        proc.send_signal(signal.SIGINT)
+        self.assertTrue(self.read_until(master, r"ctrl-c again"), self.buf)
+        self.assertIsNone(proc.poll(), "one ctrl-c should not have ended it")
+        # ... and it still takes a prompt afterwards
+        os.write(master, b"say hi\r")
+        self.assertTrue(self.read_until(master, r"done"), self.buf)
+        proc.send_signal(signal.SIGINT)
+        time.sleep(0.3)
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=15)
+
+    def test_a_lone_ctrl_c_long_after_the_first_still_does_not_quit(self):
+        proc, master = self.start()
+        self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+        proc.send_signal(signal.SIGINT)
+        self.assertTrue(self.read_until(master, r"ctrl-c again"), self.buf)
+        time.sleep(2.2)                     # past the window
+        proc.send_signal(signal.SIGINT)
+        time.sleep(1.0)
+        self.assertIsNone(proc.poll(), self.buf)
+        os.write(master, b"/quit\r")
+        proc.wait(timeout=15)
+
+    def test_sigterm_gives_the_scrolling_region_back(self):
+        proc, master = self.start()
+        self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+        self.buf = ""
+        proc.send_signal(signal.SIGTERM)
+        self.assertTrue(self.read_until(master, r"\033\[r", seconds=10)
+                        or "\033[r" in self.buf, self.buf)
+        self.assertEqual(proc.wait(timeout=15), -signal.SIGTERM)
 
 
 # ---------------------------------------------------------------- wrapper

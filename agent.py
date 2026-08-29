@@ -20,13 +20,12 @@ OpenRouter, OpenAI).
 """
 
 import atexit
-import codecs
+import difflib
+import http.client
 import json
 import os
 import re
-import select
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -36,12 +35,14 @@ import urllib.request
 from pathlib import Path
 
 import policy as pol_mod
-
-try:                       # raw keyboard input, for reading a bare escape
-    import termios
-    import tty
-except ImportError:        # not POSIX
-    termios = tty = None
+import ui
+# Re-exported so the rest of this file - and the tests - can go on calling
+# them unqualified.  `approve` and `shell_escape` deliberately stayed here,
+# so `ui.read_answer` has to be reachable as a module global of this module
+# for a test to be able to swap it out.
+from ui import (BAR, Interrupted, StatusBar, bold, cyan, dim, emit, green,
+                prompt_text, read_answer, red, termios, warn, yellow,
+                _clip, _short, _TTY)
 
 try:
     # Importing it is the whole trick: input() then routes through readline,
@@ -52,14 +53,24 @@ except ImportError:        # no line editing available
 
 
 # ---------------------------------------------------------------- config
+BAD_ENV: list = []      # settings that would not parse; main() reports them
+
+
 def _env(name: str, default, cast=str):
+    """A setting, or the default.
+
+    A bad value is remembered rather than fatal: this runs at import, so
+    exiting here would take --help and --version with it - the two commands
+    most likely to explain what went wrong.
+    """
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
     try:
         return cast(raw)
     except ValueError:
-        sys.exit(f"{name}={raw!r} is not a valid {cast.__name__}")
+        BAD_ENV.append(f"{name}={raw!r} is not a valid {cast.__name__}")
+        return default
 
 
 BASE_URL = _env("AGENT_BASE_URL", "https://api.minimax.io/v1").rstrip("/")
@@ -82,6 +93,10 @@ AUTO_APPROVE = os.environ.get("AGENT_YOLO") == "1"
 MINIMAX = "minimax" in (MODEL + BASE_URL).lower()
 GLOBAL_POLICY = Path.home() / ".miniagent" / "policy.json"
 HISTORY = Path.home() / ".miniagent" / "history"
+# Read here rather than where they are used, so a bad value reaches BAD_ENV
+# before main() reports it.
+HISTORY_LINES = _env("AGENT_HISTORY", 1000, int)
+MAX_STEPS_ENV = _env("AGENT_MAX_STEPS", 10**9, int)
 PROMPT = _env("AGENT_PROMPT", "agent> ")
 RETRY_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -99,41 +114,6 @@ if MINIMAX:
 # Filled in once the policy is loaded; the defaults keep the module importable.
 LIMITS = dict(pol_mod.DEFAULTS["limits"])
 ROOTS: list = []
-
-
-# ---------------------------------------------------------------- output
-_TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-
-
-def _c(code: str, s: str) -> str:
-    return f"\033[{code}m{s}\033[0m" if _TTY else s
-
-
-def dim(s): return _c("2", s)
-def bold(s): return _c("1", s)
-def red(s): return _c("31", s)
-def yellow(s): return _c("33", s)
-def cyan(s): return _c("36", s)
-
-
-def warn(s: str) -> None:
-    print(yellow(f"  ! {s}"), file=sys.stderr)
-
-
-def _short(s: str, n: int = 100) -> str:
-    s = " ".join(str(s).split())
-    return s if len(s) <= n else s[:n] + "..."
-
-
-def _clip(text: str, limit: int) -> str:
-    """Keep both ends of an oversized tool result - the tail usually has the
-    error message, the head usually has the shape of the output."""
-    if len(text) <= limit:
-        return text
-    head = limit * 2 // 3
-    tail = limit - head
-    cut = len(text) - limit
-    return f"{text[:head]}\n...[{cut} chars cut from the middle]...\n{text[-tail:]}"
 
 
 # ---------------------------------------------------------------- sandbox
@@ -168,6 +148,18 @@ def t_read(path: str, offset: int = 0, limit: int = 2000) -> str:
     return body + (f"\n...[{rest} more lines]" if rest > 0 else "")
 
 
+def counts(before: str, after: str) -> str:
+    """`+12 -3`, for a tool result.  The model sees this too, which is the
+    point: it should know how big a change it just made."""
+    # [2:] drops the two file headers by position. Matching them by prefix
+    # would also skip a real line of content beginning `--` or `++`.
+    body = list(difflib.unified_diff(before.splitlines(), after.splitlines(),
+                                     lineterm="", n=0))[2:]
+    plus = sum(1 for l in body if l.startswith("+"))
+    minus = sum(1 for l in body if l.startswith("-"))
+    return f"+{plus} -{minus}"
+
+
 def t_write(path: str, content: str) -> str:
     p = resolve(path)
     data = content.encode("utf-8")
@@ -175,9 +167,21 @@ def t_write(path: str, content: str) -> str:
     if len(data) > cap:
         return f"ERROR: {len(data)} bytes exceeds the policy limit of {cap}"
     existed = p.exists()
+    before, comparable = "", False
+    if existed:
+        try:
+            before = p.read_text(encoding="utf-8")
+            comparable = True
+        except (OSError, UnicodeDecodeError):
+            comparable = False      # binary or unreadable: do not guess at +/-
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
-    return f"{'overwrote' if existed else 'wrote'} {_rel(p)} ({len(data)} bytes)"
+    if not existed:
+        return (f"wrote {_rel(p)} (new file, "
+                f"{len(content.splitlines())} lines, {len(data)} bytes)")
+    if not comparable:
+        return f"overwrote {_rel(p)} (previous contents not comparable, {len(data)} bytes)"
+    return f"overwrote {_rel(p)} ({counts(before, content)}, {len(data)} bytes)"
 
 
 def t_edit(path: str, old: str, new: str) -> str:
@@ -193,7 +197,7 @@ def t_edit(path: str, old: str, new: str) -> str:
     if len(updated.encode("utf-8")) > cap:
         return f"ERROR: the result exceeds the policy limit of {cap} bytes"
     p.write_text(updated, encoding="utf-8")
-    return f"edited {_rel(p)}"
+    return f"edited {_rel(p)} ({counts(text, updated)})"
 
 
 def bash_argv(cmd: str) -> list:
@@ -365,82 +369,6 @@ def status_line(root: Path) -> str:
     return "  ".join(parts)
 
 
-class StatusBar:
-    """A line pinned to the bottom row of the terminal.
-
-    The last row is taken out of the scrolling region, so everything the agent
-    prints scrolls above it and the bar stays where it is - visible while tools
-    are running, not only at the prompt.
-    """
-
-    def __init__(self):
-        self.on = False
-        self.stale = False
-        self.text = ""
-
-    def install(self) -> bool:
-        if not _TTY or os.environ.get("AGENT_STATUS") == "off":
-            return False
-        if os.environ.get("TERM", "dumb") == "dumb":
-            return False
-        rows = shutil.get_terminal_size().lines
-        if rows < 3:
-            return False
-        # Make room for the bar. At the bottom of the screen this scrolls;
-        # anywhere else stepping back up undoes it.
-        sys.stdout.write("\n\033[1A")
-        # DECSTBM homes the cursor, so save and restore it around the change.
-        sys.stdout.write(f"\0337\033[1;{rows - 1}r\0338")
-        self.on = True
-        atexit.register(self.remove)
-        try:
-            signal.signal(signal.SIGWINCH, self._resized)
-        except (AttributeError, ValueError, OSError):
-            pass                    # no SIGWINCH here, or not the main thread
-        self.draw()
-        return True
-
-    def _resized(self, *_a) -> None:
-        # Only a flag: writing to stdout from a signal handler can re-enter a
-        # half-finished write and raise, and DECSC has one save slot per
-        # terminal, so a save here would clobber an outer draw's. The region is
-        # re-cut at the next draw instead.
-        self.stale = True
-
-    def draw(self, text: str = None) -> None:
-        if text is not None:
-            self.text = text
-        if not self.on:
-            return
-        size = shutil.get_terminal_size()
-        if self.stale:                       # the terminal was resized
-            self.stale = False
-            if size.lines < 3:
-                self.remove()
-                return
-            sys.stdout.write(f"\0337\033[1;{size.lines - 1}r\0338")
-        # not _short(): it collapses runs of spaces, and the gaps between the
-        # fields are what makes the bar readable
-        room = max(1, size.columns - 2)
-        line = self.text
-        if len(line) > room:
-            line = (line[:max(0, room - 3)] + "...")[:room]
-        sys.stdout.write(f"\0337\033[{size.lines};1H\033[2K"
-                         f"\033[90m {line}\033[0m\0338")
-        sys.stdout.flush()
-
-    def remove(self) -> None:
-        if not self.on:
-            return
-        self.on = False
-        rows = shutil.get_terminal_size().lines
-        sys.stdout.write(f"\0337\033[r\033[{rows};1H\033[2K\0338")
-        sys.stdout.flush()
-
-
-BAR = StatusBar()
-
-
 def shell_escape(line: str) -> str:
     """`!cmd` runs it as you, outside the policy - you typed it, the model did
     not. A bare `!` opens a shell. What came back is offered to the model with
@@ -492,22 +420,11 @@ def shell_escape(line: str) -> str:
                  int(LIMITS.get("max_output_chars", 20_000)))
 
 
-def prompt_text(text: str) -> str:
-    """A prompt readline can measure.
-
-    It counts the prompt's width to know where to wrap and redraw an edited
-    line, so the colour codes have to be marked as taking up no space.
-    """
-    if not _TTY:
-        return text
-    return f"\001\033[1m\002{text}\001\033[0m\002"
-
-
 def load_history() -> None:
     """Carry the prompt's history over from previous sessions."""
     if readline is None:
         return
-    readline.set_history_length(int(_env("AGENT_HISTORY", 1000, int)))
+    readline.set_history_length(HISTORY_LINES)
     try:
         readline.read_history_file(HISTORY)
     except (OSError, ValueError):
@@ -535,95 +452,35 @@ def drop_repeat() -> None:
         readline.remove_history_item(n - 2)   # 0-based, unlike get_history_item
 
 
-class Interrupted(Exception):
-    """The user pressed escape at a permission prompt."""
+DIFF_LINES = _env("AGENT_DIFF_LINES", 24, int)
+RESULT_LINES = _env("AGENT_RESULT_LINES", 6, int)
 
 
-def _pending(fd, timeout: float = 0.05) -> bool:
-    return bool(select.select([fd], [], [], timeout)[0])
+def proposed_change(tool: str, args: dict):
+    """(path, before, after) for a write the user is being asked about.
 
-
-def read_answer(prompt: str):
-    """A short answer from the terminal, or None if escape was pressed.
-
-    `input()` cannot see escape: it is line buffered, so a bare keypress never
-    arrives. Reading the descriptor directly is the only way to notice it -
-    and it has to be `os.read`, because a buffered reader would swallow the
-    rest of an arrow key before select() could tell it apart from escape.
+    Never writes anything.  Returns None when there is nothing useful to
+    show - a binary file, something outside the sandbox, a tool that does not
+    write - so the prompt falls back to naming the path, as it always did.
     """
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
-    if termios is None or not sys.stdin.isatty():
-        try:
-            return input()
-        except EOFError:
-            print()
-            return ""
-
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    decode = codecs.getincrementaldecoder("utf-8")("replace").decode
-    typed, pushed = [], []
-
-    def getch() -> str:
-        """One character, or "" at end of input. Never a partial one."""
-        if pushed:
-            return pushed.pop()
-        while True:
-            raw = os.read(fd, 1)
-            if not raw:
-                return ""
-            ch = decode(raw)
-            if ch:
-                return ch
-
+    if tool not in ("write_file", "edit_file"):
+        return None
     try:
-        # TCSAFLUSH: anything typed before the prompt appeared is dropped
-        # rather than allowed to answer a permission question by accident.
-        tty.setcbreak(fd)
-        while True:
-            ch = getch()
-            if not ch:                        # end of input
-                print()
-                return ""
-            if ch == "\x1b":
-                if not _pending(fd):          # nothing follows: a real escape
-                    print()
-                    return None
-                # An arrow key and friends. Consume exactly the sequence -
-                # draining everything available would eat the line behind it.
-                nxt = getch()
-                if nxt == "[":                # CSI: parameters, then a final byte
-                    while True:
-                        end = getch()
-                        if not end or "@" <= end <= "~":
-                            break
-                elif nxt == "O":              # SS3: one byte follows
-                    getch()
-                elif nxt:
-                    pushed.append(nxt)        # not a sequence we know
-                continue
-            if ch in ("\r", "\n"):
-                print()
-                return "".join(typed)
-            if ch == "\x03":
-                raise KeyboardInterrupt
-            if ch == "\x04":
-                print()
-                return ""
-            if ch in ("\x7f", "\b"):
-                if typed:
-                    typed.pop()
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
-                continue
-            if ch < " ":
-                continue
-            typed.append(ch)
-            sys.stdout.write(ch)
-            sys.stdout.flush()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        p = resolve(str(args.get("path") or ""))
+        before = p.read_text(encoding="utf-8") if p.is_file() else ""
+        if "\0" in before or len(before) > int(LIMITS.get("max_write_bytes", 10**6)):
+            return None
+        if tool == "write_file":
+            return _rel(p), before, str(args.get("content") or "")
+        old = str(args.get("old") or "")
+        n = before.count(old)
+        if n != 1:
+            # Worth saying out loud: the call is going to fail for this reason.
+            print(dim(f"  (no preview: the old string matches {n} places)"))
+            return None
+        return _rel(p), before, before.replace(old, str(args.get("new") or ""))
+    except (ValueError, OSError, UnicodeDecodeError):
+        return None
 
 
 def approve(pol, tool: str, args: dict, d) -> bool:
@@ -655,6 +512,11 @@ def approve(pol, tool: str, args: dict, d) -> bool:
     print(dim(f"  policy: {d.reason}" + (f"  [{d.rule}]" if d.rule else "")))
     if subject and whole and subject != whole:
         print(dim("  the rest of the line runs too, if you say yes"))
+    change = proposed_change(tool, args) if DIFF_LINES else None
+    if change:
+        _, before, after = change
+        for line in ui.diff_lines(before, after, DIFF_LINES):
+            print(line)
     if once_only:
         choices = f"  {yellow('confirm')}: this exact call only.  [y] yes   "
     else:
@@ -672,26 +534,32 @@ def approve(pol, tool: str, args: dict, d) -> bool:
     return ans.lower() in ("y", "yes")
 
 
-def call_tool(pol, name: str, args: dict) -> str:
-    """One tool call, from policy check to truncated result."""
+def call_tool(pol, name: str, args: dict) -> tuple:
+    """One tool call, from policy check to truncated result.
+
+    Returns (result, seconds).  The clock starts after the gate, so a call the
+    user thought about for a minute is not reported as a minute of work.
+    """
     if name not in TOOLS:
-        return f"ERROR: unknown tool {name}. Available: {', '.join(TOOLS)}"
+        return f"ERROR: unknown tool {name}. Available: {', '.join(TOOLS)}", 0.0
     d = pol.check(name, args)
     if d.action == "deny":
         return (f"DENIED by policy: {d.reason}"
                 + (f" (rule: {d.rule})" if d.rule else "")
                 + "\nThis is final. Do not retry it and do not route around it with "
-                  "another tool; tell the user what you needed and why.")
+                  "another tool; tell the user what you needed and why."), 0.0
     if d.action in pol_mod.ASKING and not approve(pol, name, args, d):
         return ("DENIED by the user. Do not retry the same call; ask what to do "
-                "differently, or carry on with the rest of the task.")
+                "differently, or carry on with the rest of the task."), 0.0
+    began = time.monotonic()
     try:
         out = TOOLS[name][0](**args)
     except TypeError as e:
         out = f"ERROR: wrong arguments for {name}: {e}"
     except Exception as e:  # a failing tool is data for the model, not a crash
         out = f"ERROR: {type(e).__name__}: {e}"
-    return _clip(str(out), int(LIMITS.get("max_output_chars", 20_000)))
+    took = time.monotonic() - began
+    return _clip(str(out), int(LIMITS.get("max_output_chars", 20_000))), took
 
 
 # ---------------------------------------------------------------- thinking
@@ -866,7 +734,55 @@ def _drop_rejected(code: int, text: str):
     return None
 
 
+class ApiError(Exception):
+    """The provider refused, or could not be reached.
+
+    Recoverable by construction.  The transcript belongs to the caller, so
+    raising here hands the prompt back with the conversation intact; exiting
+    would throw away everything the session had done so far.
+    """
+
+    def __init__(self, msg: str, code: int = 0):
+        super().__init__(msg)
+        self.code = code
+
+
+# Words a provider uses when the account, rather than the request, is the
+# problem.  Matched case-folded against the error body.
+QUOTA_WORDS = ("insufficient", "balance", "quota", "credit", "billing")
+LONG_WORDS = ("context length", "context_length", "maximum context",
+              "too long", "reduce the length", "max_total_tokens")
+
+# MiniMax reports these inside a 200 body, so they never reach the HTTP path.
+# (message, worth retrying)
+MINIMAX_CODES = {
+    1002: ("rate limited", True),
+    1004: ("the key was rejected - check `agent --env`", False),
+    1008: ("out of credit on this account", False),
+    1013: ("the service failed internally", True),
+    1039: ("token rate limit for this key", True),
+    2013: ("the server rejected the request body", False),
+}
+
+
+def explain(code: int, text: str) -> str:
+    """One line for the user out of a provider's error body."""
+    low = text.lower()
+    if code in (401, 403):
+        return "the key was rejected - check `agent --env`"
+    if code == 402 or any(w in low for w in QUOTA_WORDS):
+        return "out of credit or over quota on this account"
+    if code == 404:
+        return f"no such endpoint or model: {MODEL} @ {BASE_URL}"
+    if code == 400 and any(w in low for w in LONG_WORDS):
+        return "the conversation is too long for this model - try /compact"
+    if code == 429:
+        return "rate limited, and it did not clear while retrying"
+    return f"API error {code}: {_short(text, 200)}"
+
+
 def llm(messages: list, tools: list) -> dict:
+    last = "no attempt was made"
     for attempt in range(max(1, RETRIES)):
         req = urllib.request.Request(
             f"{BASE_URL}/chat/completions",
@@ -883,34 +799,63 @@ def llm(messages: list, tools: list) -> dict:
             if dropped:
                 warn(f"the server rejected `{dropped}`, retrying without it")
                 continue
+            last = explain(e.code, text)
             if e.code in RETRY_CODES and attempt + 1 < RETRIES:
                 _backoff(attempt, f"HTTP {e.code}")
                 continue
-            sys.exit(f"API error {e.code}: {text}")
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            raise ApiError(last, e.code)
+        except json.JSONDecodeError as e:
+            # A proxy or a login page answering where the API should be - or
+            # a body that was cut short, which is worth another go.
+            last = f"{BASE_URL} did not return JSON (is it a /v1 endpoint?)"
             if attempt + 1 < RETRIES:
                 _backoff(attempt, f"{type(e).__name__}: {e}")
                 continue
-            sys.exit(f"cannot reach {BASE_URL}: {e}")
+            raise ApiError(last)
+        # HTTPException is not an OSError: a response cut short raises
+        # IncompleteRead, which would otherwise escape every handler here.
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.HTTPException) as e:
+            last = f"cannot reach {BASE_URL}: {e}"
+            if attempt + 1 < RETRIES:
+                _backoff(attempt, f"{type(e).__name__}: {e}")
+                continue
+            raise ApiError(last)
+
+        if not isinstance(body, dict):      # a gateway answering with a list
+            raise ApiError(f"{BASE_URL} answered with "
+                           f"{type(body).__name__}, not an object")
 
         # MiniMax reports auth and quota failures inside a 200 response.
         resp = body.get("base_resp") or {}
-        if resp.get("status_code"):
-            sys.exit(f"API error {resp['status_code']}: {resp.get('status_msg', '')}")
+        code = resp.get("status_code")
+        if code:
+            why, again = MINIMAX_CODES.get(
+                code, (resp.get("status_msg") or "the request was refused", False))
+            last = f"{why} (MiniMax {code})"
+            if again and attempt + 1 < RETRIES:
+                _backoff(attempt, why)
+                continue
+            raise ApiError(last, code)
         choices = body.get("choices") or []
         if not choices:
-            sys.exit(f"no completion returned: {json.dumps(body)[:400]}")
+            raise ApiError("no completion returned: "
+                           f"{_short(json.dumps(body), 200)}")
         USAGE.add(body.get("usage") or {})
         msg = choices[0].get("message") or {}
         msg.setdefault("role", "assistant")
         return msg
-    sys.exit("gave up after repeated API failures")
+    raise ApiError(f"gave up after {RETRIES} failed requests: {last}")
 
 
 def _backoff(attempt: int, why: str) -> None:
     wait = min(30, 2 ** attempt)
     warn(f"{why}; retrying in {wait}s")
-    time.sleep(wait)
+    try:
+        time.sleep(wait)
+    except KeyboardInterrupt:
+        print()
+        raise
 
 
 # ---------------------------------------------------------------- prompt
@@ -1043,13 +988,14 @@ def run_turn(pol, messages: list, max_steps: int) -> None:
             fn = c.get("function") or {}
             name = fn.get("name") or "?"
             args, err = parse_args_json(fn.get("arguments"))
+            took = 0.0
             if err:
                 print(dim(f"  · {name}(<invalid json>)"))
                 result = f"ERROR: arguments were not valid JSON: {err}. Send them again as a JSON object."
             else:
-                print(dim(f"  · {name}({_short(json.dumps(args, ensure_ascii=False), 120)})"))
+                print(ui.tool_line(name, args, pol_mod.SUBJECT.get(name, "")))
                 try:
-                    result = call_tool(pol, name, args)
+                    result, took = call_tool(pol, name, args)
                 except (Interrupted, KeyboardInterrupt):
                     close_dangling(messages, STOPPED)
                     print(yellow("\n[stopped - what would you like to do instead?]"))
@@ -1059,6 +1005,8 @@ def run_turn(pol, messages: list, max_steps: int) -> None:
                 tip = shell_hint(name, args if not err else {}, result)
                 if tip:
                     print(dim(f"    {tip}"))
+            for line in ui.tool_result(name, result, took, RESULT_LINES):
+                print(line)
             # `_name` is ours: handy in the transcript, stripped before sending,
             # since `name` on a tool message is a legacy shape some servers reject
             messages.append({"role": "tool", "tool_call_id": c.get("id", ""),
@@ -1075,7 +1023,9 @@ HELP = """  /help            this text
   /think           toggle showing the model's reasoning
   up arrow         an earlier prompt; ctrl-r searches them
   /cost            tokens used this session
-  /reset           forget the conversation, keep the rules
+  /retry           send the conversation again after a failed request
+  /compact         shrink old tool output to make room
+  /clear           forget the conversation, keep the rules (alias: /reset)
   /quit            leave"""
 
 
@@ -1094,7 +1044,8 @@ def show_rules(pol) -> None:
     print(f"{bold('writable roots')}: {roots}")
 
 
-def slash(pol, cmd: str, messages: list, system: str, mine: list) -> bool:
+def slash(pol, cmd: str, messages: list, system: str, mine: list,
+          max_steps: int = 40) -> bool:
     """Returns False to quit."""
     global SHOW_THINKING
     word, _, rest = cmd[1:].partition(" ")
@@ -1128,7 +1079,23 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list) -> bool:
         print(f"  reasoning is now {'shown' if SHOW_THINKING else 'hidden'}")
     elif word == "cost":
         print(f"  {USAGE}")
-    elif word == "reset":
+    elif word == "retry":
+        # After an ApiError the user's message is still the last thing in the
+        # transcript, so sending it again is the whole of a retry.
+        if len(messages) < 2:
+            print("  nothing to retry yet")
+        elif messages[-1].get("role") == "assistant" and \
+                not messages[-1].get("tool_calls"):
+            print("  the last turn finished; say what you want instead")
+        else:
+            turn(pol, messages, max_steps)
+    elif word == "compact":
+        # Half the budget, so it frees something rather than only enough to
+        # get back under a limit the next message would cross again.
+        freed = compact(messages, CONTEXT_CHARS // 2)
+        print(f"  freed {freed:,} chars" if freed
+              else "  nothing left to shrink; /clear starts fresh")
+    elif word in ("reset", "clear"):
         del messages[1:]
         messages[0] = {"role": "system", "content": system}
         mine.clear()          # including anything `!` produced but never sent
@@ -1167,11 +1134,42 @@ def init_policy() -> None:
     print(f"wrote {GLOBAL_POLICY}")
 
 
+def _terminate(sig, _frame):
+    """Give the terminal back, then die of the signal we were sent.
+
+    atexit does not run for SIGTERM or SIGHUP, so without this the scrolling
+    region stays one row short in whatever shell comes next.  Re-raising
+    rather than exiting keeps the status the 128+n a caller expects.
+    """
+    BAR.remove()
+    signal.signal(sig, signal.SIG_DFL)
+    os.kill(os.getpid(), sig)
+
+
 def setup(root: Path):
     pol = pol_mod.load(root, prompt=trust_prompt)
     LIMITS.update(pol.limits)
     ROOTS[:] = pol.roots(root)
     return pol
+
+
+def turn(pol, messages: list, max_steps: int) -> None:
+    """One turn, with the two ways it can end badly already handled.
+
+    Both leave the transcript in a state the next request will accept, which
+    is the whole point: neither a refusal nor a dropped connection should cost
+    the user the conversation.
+    """
+    try:
+        run_turn(pol, messages, max_steps)
+    except KeyboardInterrupt:
+        close_dangling(messages, "STOPPED by the user with ctrl-c. Wait for "
+                                 "their next message.")
+        print(yellow("\n[interrupted - what would you like to do instead?]"))
+    except ApiError as e:
+        close_dangling(messages, "The request failed before this call ran.")
+        print(red(f"\n  ! {e}"))
+        print(dim("  the conversation is intact - /retry sends it again"))
 
 
 def main() -> None:
@@ -1182,6 +1180,8 @@ def main() -> None:
     if "--init-policy" in argv:
         init_policy()
         return
+    if BAD_ENV:
+        sys.exit("\n".join(BAD_ENV))
 
     prompt = ""
     if "-p" in argv or "--print" in argv:
@@ -1219,7 +1219,7 @@ def main() -> None:
 
     if not API_KEY:
         warn("no AGENT_API_KEY / MINIMAX_API_KEY set; the first request will fail")
-    max_steps = min(int(_env("AGENT_MAX_STEPS", 10**9, int)),
+    max_steps = min(MAX_STEPS_ENV,
                     int(LIMITS.get("max_steps", 40)))
     system = system_prompt(root, pol)
     messages = [{"role": "system", "content": system}]
@@ -1231,54 +1231,72 @@ def main() -> None:
     notes = notes_files(root)
     if notes:
         print(dim(f"  notes {', '.join(str(n) for n in notes)}"))
-    print(dim("  /help for commands, ctrl-c to quit"))
+    print(dim("  /help for commands, ctrl-c twice to quit"))
 
     if prompt:
         messages.append({"role": "user", "content": prompt})
-        run_turn(pol, messages, max_steps)
+        try:
+            run_turn(pol, messages, max_steps)
+        except ApiError as e:
+            sys.exit(f"{e}")
+        except KeyboardInterrupt:
+            close_dangling(messages, "STOPPED by the user with ctrl-c.")
+            sys.exit(130)
         print(dim(f"\n{USAGE}"))
         return
 
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _terminate)
+        except (AttributeError, ValueError, OSError):
+            pass                # not this platform, or not the main thread
+
     BAR.install()
     mine: list = []          # what you ran with `!`, to hand over next message
+    hit_at = 0.0             # when ctrl-c was last pressed at the prompt
 
-    while True:
-        try:
-            print()
-            if BAR.on:
-                BAR.draw(status_line(root))
-            else:
-                print(dim(status_line(root)))
-            user = input(prompt_text(PROMPT)).strip()
-            drop_repeat()
-        except (EOFError, KeyboardInterrupt):
-            BAR.remove()
-            print(dim(f"\n{USAGE}"))
-            return
-        if not user:
-            continue
-        if user.startswith("!"):
-            got = shell_escape(user)
-            if got:
-                mine.append(got)
-            continue
-        if user.startswith("/"):
-            if not slash(pol, user, messages, system, mine):
-                BAR.remove()
-                print(dim(f"{USAGE}"))
+    try:
+        while True:
+            try:
+                print()
+                if BAR.on:
+                    BAR.draw(status_line(root))
+                else:
+                    print(dim(status_line(root)))
+                user = input(prompt_text(PROMPT)).strip()
+                drop_repeat()
+            except EOFError:              # ctrl-d has only ever meant leave
                 return
-            continue
-        if mine:
-            user = ("Commands I ran myself just now:\n\n"
-                    + "\n\n".join(mine) + "\n\n" + user)
-            mine.clear()
-        messages.append({"role": "user", "content": user})
-        try:
-            run_turn(pol, messages, max_steps)
-        except KeyboardInterrupt:
-            close_dangling(messages, "STOPPED by the user with ctrl-c. Wait for "
-                                     "their next message.")
-            print(yellow("\n[interrupted - what would you like to do instead?]"))
+            except KeyboardInterrupt:
+                # A half-typed line is the usual reason for this, so one press
+                # throws the line away and two in a row mean it.
+                now = time.monotonic()
+                if now - hit_at < 2.0:
+                    return
+                hit_at = now
+                print(dim("\n  (ctrl-c again to quit, or /quit)"))
+                continue
+            hit_at = 0.0
+            if not user:
+                continue
+            if user.startswith("!"):
+                got = shell_escape(user)
+                if got:
+                    mine.append(got)
+                continue
+            if user.startswith("/"):
+                if not slash(pol, user, messages, system, mine, max_steps):
+                    return
+                continue
+            if mine:
+                user = ("Commands I ran myself just now:\n\n"
+                        + "\n\n".join(mine) + "\n\n" + user)
+                mine.clear()
+            messages.append({"role": "user", "content": user})
+            turn(pol, messages, max_steps)
+    finally:
+        BAR.remove()
+        print(dim(f"\n{USAGE}"))
 
 
 if __name__ == "__main__":

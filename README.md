@@ -53,8 +53,12 @@ agent                                                  # the current directory
 ```
 agent> fix the failing login test
 
-  · bash({"cmd": "pytest -q"})
-  · edit_file({"path": "auth.py"})
+  · bash(pytest -q)
+    exit 1  14 lines  2.3s
+    FAILED tests/test_auth.py::test_expired_token
+    1 failed, 17 passed in 2.21s
+  · edit_file(auth.py)
+    edited auth.py (+3 -1)
 
 Fixed the token check in auth.py.
 
@@ -65,7 +69,11 @@ agent> ▏
 
 Type your task at the `agent>` prompt. The agent reads, edits and runs commands
 to do it, asking you before anything the rules do not already cover. `/help`
-lists the commands, `ctrl-c` leaves. `AGENT_PROMPT` renames the prompt.
+lists the commands, `ctrl-c` twice leaves. `AGENT_PROMPT` renames the prompt.
+
+Every call says what it did: the exit status and the ends of the output for a
+command, `+N -M` for an edit. `AGENT_RESULT_LINES` sets how much is shown,
+default 6; `0` goes back to naming the call and nothing else.
 
 A grey bar is pinned to the bottom row: where the agent is working, the branch,
 and a `*` if the tree is dirty — all of which can change under you when the
@@ -235,6 +243,25 @@ nothing is written down, so a decision made in one afternoon's context cannot
 outlive it — that is the one to reach for. `A` is the same rule appended to
 your global file, in force from now on.
 
+A write shows what it would do before you answer, so `y` is not a guess:
+
+```
+  edit_file: auth.py
+  policy: no rule matched (default_action)
+  @@ -18,7 +18,7 @@
+   def check(token):
+  -    if token:
+  +    if token and not expired(token):
+           return claims(token)
+  +1 -1
+  [y] once   [a] session   [A] save edit_file(auth.py)   [N] no   [esc] stop >
+```
+
+Nothing is written to work the diff out. A binary file, a path outside the
+working directory, or an `old` string that matches more than once shows no
+preview — the last of those says so, since it is also why the call is about to
+fail. `AGENT_DIFF_LINES` caps the length, default 24; `0` turns it off.
+
 A `confirm` looks different: there is nothing to press but yes or no, and it
 shows the **whole** command line rather than the part that matched, untruncated
 — what you are agreeing to is everything a `y` will run, not the segment the
@@ -279,6 +306,23 @@ An interrupted turn still leaves an answer for every tool call the model made,
 so the conversation survives the interruption instead of being rejected by the
 API on the next message.
 
+### When the request fails
+
+A refused key, a rate limit, an endpoint that has gone away: none of them end
+the session. You get one line saying what happened, and the prompt back with
+the conversation intact — `/retry` sends it again.
+
+```
+agent> summarise what we changed
+
+  ! the key was rejected - check `agent --env`
+  the conversation is intact - /retry sends it again
+```
+
+MiniMax reports auth and quota failures inside an HTTP 200, so those are read
+out of the body and named the same way. Rate limits and internal errors are
+retried with backoff first, and only reported if they do not clear.
+
 ## Tuned for MiniMax-M2.5
 
 | what | why |
@@ -300,7 +344,9 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 /help            /rules           the rules in force and where they came from
 /policy T SUBJ   explain one decision, e.g. /policy bash git push
 /notes           the standing instructions it was given
-/think           /cost            /reset           /quit
+/think           /cost            /clear           /quit
+/retry           send the conversation again after a failed request
+/compact         shrink old tool output to make room
 
 !cmd             run a command yourself; ! alone opens a shell
 up arrow         an earlier prompt; ctrl-r searches them
@@ -356,6 +402,8 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_PROMPT` | `agent> ` |
 | `AGENT_STATUS` | on; `off` hides the bottom bar |
 | `AGENT_HISTORY` | `1000` lines kept |
+| `AGENT_DIFF_LINES` | `24` lines of diff at a permission prompt; `0` hides it |
+| `AGENT_RESULT_LINES` | `6` lines of tool output; `0` hides it |
 
 ## Tests
 
