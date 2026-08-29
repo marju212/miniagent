@@ -70,6 +70,17 @@ import agent          # noqa: E402
 import policy         # noqa: E402
 
 
+@contextlib.contextmanager
+def _patch(obj, name, value):
+    """Swap an attribute for the duration of a block, then put it back."""
+    saved = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, saved)
+
+
 def make_policy(**over) -> policy.Policy:
     data = json.loads(json.dumps(policy.DEFAULTS))
     data.update(over)
@@ -157,6 +168,73 @@ class Decisions(unittest.TestCase):
         self.assertEqual(d.action, "ask")
         self.assertEqual(d.subject, "echo hi > out.txt")
 
+    def test_confirm_outranks_allow_so_an_approval_cannot_cover_it(self):
+        pol = make_policy(confirm=["bash(git push --force*)"],
+                          allow=["bash(git *)"])
+        self.assertEqual(pol.check("bash", {"cmd": "git status"}).action, "allow")
+        self.assertEqual(pol.check("bash", {"cmd": "git push --force"}).action,
+                         "confirm")
+
+    def test_deny_still_beats_confirm(self):
+        pol = make_policy(deny=["bash(rm *)"], confirm=["bash(rm *)"])
+        self.assertEqual(pol.check("bash", {"cmd": "rm x"}).action, "deny")
+
+    def test_a_confirm_segment_carries_the_whole_compound_command(self):
+        pol = make_policy(confirm=["bash(rm -rf *)"], allow=["bash(ls*)"])
+        d = pol.check("bash", {"cmd": "ls && rm -rf build"})
+        self.assertEqual(d.action, "confirm")
+        self.assertEqual(d.subject, "rm -rf build")
+
+    def test_a_secret_is_denied_however_the_path_is_written(self):
+        # `**/` is built from `name/` segments; if it cannot span the leading
+        # slash of an absolute path, `read_file(**)` quietly allows the lot.
+        pol = make_policy()
+        for path in (".env", "proj/.env", "./proj/.env", "/home/u/proj/.env",
+                     "/home/u/.aws/credentials", "/home/u/.ssh/id_rsa"):
+            with self.subTest(path=path):
+                self.assertEqual(pol.check("read_file", {"path": path}).action,
+                                 "deny")
+        self.assertEqual(pol.check("read_file", {"path": "/srv/app/main.py"}).action,
+                         "allow")
+
+    def test_the_git_directory_is_protected_below_the_root_too(self):
+        pol = make_policy()
+        for path in (".git/config", "/repo/.git/config", "sub/.git/config"):
+            with self.subTest(path=path):
+                self.assertEqual(pol.check("write_file", {"path": path}).action,
+                                 "deny")
+
+    def test_the_spellings_of_a_destructive_flag_all_reach_confirm(self):
+        pol = make_policy()
+        for cmd in ("rm -rf build", "rm -rfv build", "rm -fr build",
+                    "rm -fR build", "rm -Rf build", "rm -r build",
+                    "rm --recursive --force build",
+                    "git push --force", "git push -f", "git push origin +master",
+                    "git reset --hard HEAD", "git clean -fd"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(pol.check("bash", {"cmd": cmd}).action, "confirm")
+
+    def test_a_confirm_rule_guards_its_own_words_and_no_more(self):
+        pol = make_policy()
+        self.assertTrue(pol.guards("rm -rfv build"))
+        self.assertTrue(pol.guards("git push origin main"))
+        self.assertFalse(pol.guards("git commit -m x"))
+        self.assertFalse(pol.guards("npm install lodash"))
+
+    def test_the_rule_file_guard_covers_relative_and_absolute_paths(self):
+        pol = make_policy()
+        for path in (".miniagent/policy.json", "./.miniagent/policy.json",
+                     "sub/.miniagent/policy.json", "/home/x/.miniagent/policy.json",
+                     "/.miniagent/env"):
+            with self.subTest(path=path):
+                self.assertEqual(pol.check("write_file", {"path": path}).action,
+                                 "confirm")
+        self.assertEqual(pol.check("write_file", {"path": "src/app.py"}).action, "ask")
+
+    def test_sudo_stays_denied_and_is_not_merely_a_confirm(self):
+        self.assertEqual(make_policy().check("bash", {"cmd": "sudo apt update"}).action,
+                         "deny")
+
     def test_unmatched_calls_fall_to_default_action(self):
         self.assertEqual(make_policy().check("bash", {"cmd": "frobnicate"}).action, "ask")
         self.assertEqual(make_policy(default_action="deny")
@@ -170,6 +248,17 @@ class Decisions(unittest.TestCase):
     def test_a_malformed_rule_is_reported_not_raised_as_a_traceback(self):
         with self.assertRaises(SystemExit):
             make_policy(allow=["bash(unclosed"])
+
+    def test_a_bogus_default_action_names_the_file_it_came_from(self):
+        with self.assertRaises(SystemExit) as caught:
+            policy.validate({"default_action": "yolo"}, "/some/policy.json")
+        self.assertIn("/some/policy.json", str(caught.exception))
+        self.assertIn("yolo", str(caught.exception))
+
+    def test_an_unknown_action_never_passes_for_the_stricter_one(self):
+        self.assertEqual(policy._stricter("yolo", "deny"), "deny")
+        self.assertEqual(policy._stricter("deny", "yolo"), "deny")
+        self.assertEqual(policy._stricter("yolo", "allow"), "yolo")
 
 
 # ---------------------------------------------------------------- layering
@@ -259,6 +348,25 @@ class Remember(unittest.TestCase):
         out = Path(tempfile.mkdtemp()) / "policy.json"
         pol.remember(out, "bash(sudo *)")
         self.assertEqual(pol.check("bash", {"cmd": "sudo ls"}).action, "deny")
+
+    def test_a_session_approval_takes_effect_without_touching_disk(self):
+        pol = make_policy()
+        self.assertEqual(pol.check("bash", {"cmd": "frobnicate x"}).action, "ask")
+        before = sorted(Path(HOME).rglob("*"))
+        self.assertIn("session", pol.remember_session("bash(frobnicate*)"))
+        self.assertEqual(pol.check("bash", {"cmd": "frobnicate x"}).action, "allow")
+        self.assertEqual(sorted(Path(HOME).rglob("*")), before)
+
+    def test_policy_can_forbid_remembering_for_the_session_too(self):
+        pol = make_policy(persist_approvals=False)
+        self.assertIn("disabled", pol.remember_session("bash(frobnicate*)"))
+        self.assertEqual(pol.check("bash", {"cmd": "frobnicate x"}).action, "ask")
+
+    def test_remembering_the_same_rule_twice_does_not_duplicate_it(self):
+        pol = make_policy()
+        pol.remember_session("bash(frobnicate*)")
+        pol.remember_session("bash(frobnicate*)")
+        self.assertEqual(pol.data["allow"].count("bash(frobnicate*)"), 1)
 
     def test_policy_can_forbid_saving(self):
         pol = make_policy(persist_approvals=False)
@@ -536,6 +644,152 @@ class Notes(unittest.TestCase):
     def test_no_instruction_file_at_all_is_fine(self):
         self.assertEqual(agent.notes_files(self.root), [])
         self.assertEqual(agent.project_notes(self.root), "")
+
+
+class ShellHint(unittest.TestCase):
+    """After a policy deny, offer the one route that is left: run it yourself."""
+
+    def setUp(self):
+        agent.OFFERED.clear()
+        self.addCleanup(agent.OFFERED.clear)
+
+    def hint(self, cmd, result="DENIED by policy: matched deny rule"):
+        return agent.shell_hint("bash", {"cmd": cmd}, result)
+
+    def test_a_denied_command_comes_back_ready_to_paste(self):
+        self.assertEqual(self.hint("sudo apt update"),
+                         "to run it as yourself, outside the policy:  !sudo apt update")
+
+    def test_it_is_offered_once_per_command_not_once_per_attempt(self):
+        self.assertTrue(self.hint("sudo apt update"))
+        self.assertFalse(self.hint("sudo apt update"))
+        self.assertTrue(self.hint("sudo apt install x"))
+
+    def test_saying_no_yourself_is_not_answered_with_a_way_around_it(self):
+        self.assertFalse(self.hint("sudo ls", result="DENIED by the user."))
+
+    def test_only_bash_gets_one_since_only_bash_fits_on_the_prompt_line(self):
+        self.assertFalse(agent.shell_hint("write_file", {"path": ".env"},
+                                          "DENIED by policy: matched deny rule"))
+
+    def test_nothing_that_would_not_survive_being_pasted_back(self):
+        self.assertFalse(self.hint(""))
+        self.assertFalse(self.hint("sudo sh -c 'a\nb'"))   # `!` reads one line
+        self.assertFalse(self.hint("sudo " + "x" * 300))
+
+
+# ---------------------------------------------------------------- prompt
+class Approving(unittest.TestCase):
+    """What `approve` offers, and what it refuses to offer."""
+
+    def ask(self, decision, typed="y", yolo=False):
+        """Run one permission prompt with a canned answer.
+
+        Returns (approved, everything the user saw, the policy afterwards).
+        The line of choices is the prompt argument to read_answer rather than
+        anything printed, so collect it there.
+        """
+        pol = make_policy()
+        screen, asked = io.StringIO(), []
+
+        def fake_read_answer(prompt):
+            asked.append(prompt)
+            return typed
+
+        with contextlib.redirect_stdout(screen):
+            with _patch(agent, "read_answer", fake_read_answer), \
+                 _patch(agent, "AUTO_APPROVE", yolo), \
+                 _patch(sys.stdin, "isatty", lambda: True):
+                ok = agent.approve(pol, "bash", {"cmd": decision.subject}, decision)
+        return ok, screen.getvalue() + "".join(asked), pol
+
+    def confirm(self, cmd="rm -rf build"):
+        return policy.Decision("confirm", "matched confirm rule",
+                               "bash(rm -rf *)", cmd)
+
+    def plain(self, cmd="frobnicate x"):
+        return policy.Decision("ask", "no rule matched", "", cmd)
+
+    def test_an_ask_offers_both_a_session_and_a_saved_approval(self):
+        _, screen, _ = self.ask(self.plain())
+        self.assertIn("[a] session", screen)
+        self.assertIn("[A] save", screen)
+
+    def test_a_confirm_shows_the_whole_line_not_just_the_part_that_matched(self):
+        # `rm -rf a && rm -rf ../b` matches on the first segment, but a `y`
+        # runs both - so both have to be on screen.
+        whole = "rm -rf node_modules && rm -rf ../sibling/dist"
+        d = policy.Decision("confirm", "matched confirm rule",
+                            "bash(rm -rf*)", "rm -rf node_modules")
+        pol = make_policy()
+        screen, asked = io.StringIO(), []
+        with contextlib.redirect_stdout(screen):
+            with _patch(agent, "read_answer", lambda p: asked.append(p) or "n"), \
+                 _patch(sys.stdin, "isatty", lambda: True):
+                agent.approve(pol, "bash", {"cmd": whole}, d)
+        out = screen.getvalue() + "".join(asked)
+        self.assertIn("../sibling/dist", out)
+        self.assertIn("the rest of the line runs too", out)
+
+    def test_a_confirm_is_never_truncated(self):
+        long = "rm -rf " + " ".join(f"dir{i}" for i in range(60))
+        d = policy.Decision("confirm", "matched confirm rule", "bash(rm -rf*)", long)
+        _, screen, _ = self.ask(d)
+        self.assertIn("dir59", screen)
+        self.assertNotIn("...", screen)
+
+    def test_a_guarded_command_can_only_be_saved_as_itself(self):
+        # `rm -rfv x` slips past the confirm patterns, so it arrives as an ask.
+        # The rule offered there must not be a blanket `bash(rm*)`.
+        d = policy.Decision("ask", "no rule matched", "", "rm -rfv build")
+        _, screen, _ = self.ask(d, typed="n")
+        self.assertIn("bash(rm -rfv build)", screen)
+        self.assertNotIn("bash(rm*)", screen)
+
+    def test_an_unguarded_command_still_gets_a_useful_rule(self):
+        d = policy.Decision("ask", "no rule matched", "", "npm install lodash")
+        _, screen, _ = self.ask(d, typed="n")
+        self.assertIn("bash(npm install*)", screen)
+
+    def test_a_confirm_offers_no_way_to_answer_it_once_and_for_all(self):
+        ok, screen, _ = self.ask(self.confirm())
+        self.assertTrue(ok)
+        self.assertNotIn("[a]", screen)
+        self.assertNotIn("[A]", screen)
+        self.assertIn("this exact call only", screen)
+
+    def test_pressing_a_at_a_confirm_is_not_a_yes(self):
+        for typed in ("a", "A", "always"):
+            with self.subTest(typed=typed):
+                ok, _, pol = self.ask(self.confirm(), typed=typed)
+                self.assertFalse(ok)
+                self.assertEqual(pol.check("bash", {"cmd": "rm -rf build"}).action,
+                                 "confirm")
+
+    def test_a_session_approval_does_not_outlive_the_policy_object(self):
+        ok, screen, pol = self.ask(self.plain(), typed="a")
+        self.assertTrue(ok)
+        self.assertIn("rest of this session", screen)
+        self.assertEqual(pol.check("bash", {"cmd": "frobnicate x"}).action, "allow")
+        # a fresh load knows nothing about it
+        self.assertEqual(make_policy().check("bash", {"cmd": "frobnicate x"}).action,
+                         "ask")
+
+    def test_yolo_waves_an_ask_through_but_never_a_confirm(self):
+        ok, screen, _ = self.ask(self.plain(), typed="", yolo=True)
+        self.assertTrue(ok)
+        self.assertIn("auto-approved", screen)
+
+        ok, screen, _ = self.ask(self.confirm(), typed="", yolo=True)
+        self.assertFalse(ok)
+        self.assertNotIn("auto-approved", screen)
+
+    def test_a_confirm_off_a_terminal_is_a_no(self):
+        pol = make_policy()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with _patch(sys.stdin, "isatty", lambda: False):
+                self.assertFalse(agent.approve(pol, "bash", {"cmd": "rm -rf build"},
+                                               self.confirm()))
 
 
 # ---------------------------------------------------------------- escape
@@ -1046,7 +1300,7 @@ class ArrowKeys(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- wrapper
-WRAPPER = HERE / "miniagent"
+WRAPPER = HERE / "agent"
 
 
 def run_wrapper(*args, home, env=None):
@@ -1167,7 +1421,7 @@ class InteractiveSetup(unittest.TestCase):
                             (r"api key", b"sk-or-1\r")])
         self.assertIn("linked", out)
         self.assertEqual(self.exports()["AGENT_BASE_URL"], "https://openrouter.ai/api/v1")
-        self.assertTrue((self.bindir / "miniagent").is_symlink())
+        self.assertTrue((self.bindir / "agent").is_symlink())
 
     def test_a_key_with_a_quote_in_it_survives_the_round_trip(self):
         # the file is sourced as shell, so an unescaped quote would break it
@@ -1346,9 +1600,9 @@ class Wrapper(unittest.TestCase):
         bindir = self.home / "bin"
         r = run_wrapper("--install", str(bindir), home=self.home,
                         env={"PATH": f"{bindir}:{os.environ['PATH']}"})
-        link = bindir / "miniagent"
+        link = bindir / "agent"
         self.assertTrue(link.is_symlink(), r.stdout + r.stderr)
-        self.assertTrue(os.readlink(link).startswith("/"))   # not `./miniagent`
+        self.assertTrue(os.readlink(link).startswith("/"))   # not `./agent`
         self.assertEqual(link.resolve(), WRAPPER.resolve())
         self.assertTrue(self.env_file.exists())
         through = subprocess.run(

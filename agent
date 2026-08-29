@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# miniagent - loads your settings, then runs the agent.
+# agent - miniagent's launcher: loads your settings, then runs agent.py.
 #
 # Your exports live in ~/.miniagent/env, next to policy.json and trusted.json.
 # Anything already set in your shell wins over that file, so a one-off
 #
-#     AGENT_MODEL=MiniMax-M2.5-highspeed miniagent ~/code/proj
+#     AGENT_MODEL=MiniMax-M2.5-highspeed agent ~/code/proj
 #
 # still does what it says.
 #
@@ -32,21 +32,21 @@ while [ -L "$SELF" ]; do
 done
 HERE=$(cd -P "$(dirname "$SELF")" && pwd)
 
-die() { printf 'miniagent: %s\n' "$*" >&2; exit 1; }
+die() { printf 'agent: %s\n' "$*" >&2; exit 1; }
 
 [ -f "$HERE/agent.py" ] || die "cannot find agent.py next to $SELF"
 
 
 usage() {
     cat <<'EOF'
-usage: miniagent [wrapper option] | [agent option] [directory]
+usage: agent [wrapper option] | [agent option] [directory]
 
 wrapper options
   --install [bindir]   symlink onto your PATH (default ~/.local/bin), then
                        ask for endpoint, model and key if they are not set yet
   --init               ask for endpoint, model and key, and save them
   --env                print the path of the settings file
-                       (edit it with: $EDITOR "$(miniagent --env)")
+                       (edit it with: $EDITOR "$(agent --env)")
 
 everything else is passed straight to agent.py:
 EOF
@@ -158,7 +158,7 @@ merge_env() {                           # merge_env URL_LINE MODEL_LINE KEY_LINE
 
 fresh_env() {                           # fresh_env URL_LINE MODEL_LINE KEY_LINE
     cat <<'EOF'
-# miniagent settings.  Sourced by the `miniagent` wrapper as shell, so command
+# miniagent settings.  Sourced by the `agent` wrapper as shell, so command
 # substitution works.  Anything already set in your shell wins over what is
 # here.  Keep it private - it holds your API key.
 
@@ -229,7 +229,7 @@ setup_env() {
 
     write_env_file "$url" "$model" "$key"
     [ -n "$key" ] || printf '\nno key yet. Put one in with: %s\n' \
-                            "\$EDITOR \"\$(miniagent --env)\"" >&2
+                            "\$EDITOR \"\$(agent --env)\"" >&2
 }
 
 
@@ -247,7 +247,7 @@ shell_rc() {
 
 install_self() {
     local bindir=${1:-$HOME/.local/bin}
-    local link=$bindir/miniagent
+    local link=$bindir/agent
     mkdir -p "$bindir"
 
     if [ -e "$link" ] && [ ! -L "$link" ]; then
@@ -255,6 +255,15 @@ install_self() {
     fi
     ln -sfn "$SELF" "$link"
     printf 'linked  %s -> %s\n' "$link" "$SELF"
+
+    # The command was called `miniagent` before, and that link points at the
+    # old name next to this script - never at $SELF, which is now `agent`.
+    # Anything else on PATH called miniagent is not ours to move.
+    local stale=$bindir/miniagent
+    if [ -L "$stale" ] && [ "$(readlink "$stale")" = "$(dirname "$SELF")/miniagent" ]; then
+        rm -f "$stale"
+        printf 'removed %s (the command is now `agent`)\n' "$stale"
+    fi
 
     if [ ! -f "$ENV_FILE" ]; then
         setup_env
@@ -266,7 +275,7 @@ install_self() {
         if interactive; then
             setup_env
         else
-            printf '        put one in with: $EDITOR "$(miniagent --env)"\n'
+            printf '        put one in with: $EDITOR "$(agent --env)"\n'
         fi
     fi
 
@@ -285,7 +294,7 @@ install_self() {
         read -r -p "add it now? [y/N] " answer
         case $answer in
             y|Y|yes)
-                printf '\n# added by miniagent --install\n%s\n' "$line" >> "$rc"
+                printf '\n# added by agent --install\n%s\n' "$line" >> "$rc"
                 printf 'added to %s; run: source %s\n' "$rc" "$rc" ;;
         esac
     fi
@@ -310,7 +319,7 @@ if [ -f "$ENV_FILE" ]; then
     perms=$(stat -c %a "$ENV_FILE" 2>/dev/null || stat -f %Lp "$ENV_FILE" 2>/dev/null || echo 600)
     case $perms in
         *00) ;;
-        *) printf 'miniagent: %s is readable by others; chmod 600 it\n' "$ENV_FILE" >&2 ;;
+        *) printf 'agent: %s is readable by others; chmod 600 it\n' "$ENV_FILE" >&2 ;;
     esac
 
     # What the caller set explicitly outranks the file, so remember it first.

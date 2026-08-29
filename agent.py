@@ -4,7 +4,7 @@ miniagent - a Claude Code-shaped coding agent in one file, tuned for MiniMax-M2.
 
 Everything the agent may do comes out of a JSON rule file; the global one lives
 at ~/.miniagent/policy.json.  Nothing is baked into the loop: every tool call is
-put to the policy first and comes back allow / ask / deny.
+put to the policy first and comes back allow / ask / confirm / deny.
 
     export AGENT_API_KEY=...                    # or MINIMAX_API_KEY
     python3 agent.py ~/code/my-project          # interactive
@@ -262,11 +262,20 @@ def tool_schema() -> list:
 
 
 # ---------------------------------------------------------------- the gate
-def suggest_rule(tool: str, subject: str) -> str:
-    """A rule the user could save for a call like this one."""
+def suggest_rule(tool: str, subject: str, guarded=lambda _c: False) -> str:
+    """A rule the user could save for a call like this one.
+
+    `guarded` answers "does a confirm rule speak for this command".  If it
+    does, the rule gets no trailing `*`: the most `rm -rfv build` can be
+    approved for is itself, spelled out, because a blanket `bash(rm*)` saved
+    here would cover every spelling of `-rf` the confirm list happens to miss.
+    Always, but never a blank cheque.
+    """
     if not subject:
         return tool
     if tool == "bash":
+        if guarded(subject):
+            return f"bash({pol_mod.escape_glob(subject.strip())})"
         try:
             words = shlex.split(subject)
         except ValueError:
@@ -275,6 +284,32 @@ def suggest_rule(tool: str, subject: str) -> str:
             take = 2 if len(words) > 1 and not words[1].startswith("-") else 1
             return f"bash({pol_mod.escape_glob(' '.join(words[:take]))}*)"
     return f"{tool}({pol_mod.escape_glob(subject)})"
+
+
+# Commands we have already offered to hand back, so the tip is said once.
+OFFERED: set = set()
+
+
+def shell_hint(tool: str, args: dict, result: str) -> str:
+    """The `!` line to offer after a refusal, or "" for no tip.
+
+    A policy deny is the one refusal with nothing behind it: the model is told
+    not to retry and not to route around it, so without this the turn just
+    stops. Saying the other thing that is true - you can still run it as
+    yourself, outside the policy - turns a dead end into the next keystroke.
+
+    Only for `bash`, since `!` takes a command; only for a `deny`, since the
+    user answering `no` has already made the decision; and only once per
+    command, because a tip repeated is a tip ignored.
+    """
+    if tool != "bash" or not result.startswith("DENIED by policy"):
+        return ""
+    cmd = str(args.get("cmd", "") or "").strip()
+    # `!` reads a single line, and a wrapped one is no longer copyable.
+    if not cmd or "\n" in cmd or len(cmd) > 200 or cmd in OFFERED:
+        return ""
+    OFFERED.add(cmd)
+    return f"to run it as yourself, outside the policy:  !{cmd}"
 
 
 def tilde(p: Path) -> str:
@@ -592,27 +627,49 @@ def read_answer(prompt: str):
 
 
 def approve(pol, tool: str, args: dict, d) -> bool:
-    """Put an `ask` decision to the user.  Returns True to run it once."""
-    subject = d.subject or str(args.get(pol_mod.SUBJECT.get(tool, ""), "") or "")
-    label = f"{tool}: {_short(subject, 120)}" if subject else tool
-    if AUTO_APPROVE:
+    """Put an `ask` or `confirm` decision to the user.  True to run it once.
+
+    A `confirm` decision is answerable once and only once: no `a`, no `A`, and
+    AGENT_YOLO does not cover it.  The point of that bucket is that a person
+    reads the exact command every time, which a blanket yes would undo.
+    """
+    # What runs is the whole call; `d.subject` is only the part of it that the
+    # rule matched.  Showing the segment alone would mean `rm -rf a && rm -rf
+    # ../b` prompts as `rm -rf a`, and one `y` runs both - the exact thing this
+    # prompt exists to prevent.  So the label is the whole thing, and the rule
+    # line says which part of it objected.
+    whole = str(args.get(pol_mod.SUBJECT.get(tool, ""), "") or "")
+    subject = d.subject or whole
+    once_only = d.action == "confirm"
+    # A confirm is read, not skimmed: never truncate what it will run.
+    shown = whole or subject if once_only else _short(whole or subject, 120)
+    label = f"{tool}: {shown}" if shown else tool
+    if AUTO_APPROVE and not once_only:
         print(dim(f"  ~ auto-approved  {label}"))
         return True
     if not sys.stdin.isatty():
         return False
-    rule = suggest_rule(tool, subject)
+    rule = suggest_rule(tool, subject, pol.guards)
     print()
     print("  " + bold(label))
     print(dim(f"  policy: {d.reason}" + (f"  [{d.rule}]" if d.rule else "")))
-    ans = read_answer(f"  [y] once   [a] always, save {cyan(rule)}   "
-                      f"[N] no   [esc] stop > ")
+    if subject and whole and subject != whole:
+        print(dim("  the rest of the line runs too, if you say yes"))
+    if once_only:
+        choices = f"  {yellow('confirm')}: this exact call only.  [y] yes   "
+    else:
+        choices = (f"  [y] once   [a] session   [A] save {cyan(rule)}   ")
+    ans = read_answer(choices + f"[N] no   [esc] stop > ")
     if ans is None:
         raise Interrupted
-    ans = ans.strip().lower()
-    if ans in ("a", "always"):
+    ans = ans.strip()
+    if not once_only and ans in ("a", "always"):
+        print(dim("  " + pol.remember_session(rule)))
+        return True
+    if not once_only and ans == "A":
         print(dim("  " + pol.remember(GLOBAL_POLICY, rule)))
         return True
-    return ans in ("y", "yes")
+    return ans.lower() in ("y", "yes")
 
 
 def call_tool(pol, name: str, args: dict) -> str:
@@ -625,7 +682,7 @@ def call_tool(pol, name: str, args: dict) -> str:
                 + (f" (rule: {d.rule})" if d.rule else "")
                 + "\nThis is final. Do not retry it and do not route around it with "
                   "another tool; tell the user what you needed and why.")
-    if d.action == "ask" and not approve(pol, name, args, d):
+    if d.action in pol_mod.ASKING and not approve(pol, name, args, d):
         return ("DENIED by the user. Do not retry the same call; ask what to do "
                 "differently, or carry on with the rest of the task.")
     try:
@@ -906,6 +963,7 @@ def project_notes(root: Path) -> str:
 
 def system_prompt(root: Path, pol) -> str:
     deny = ", ".join(pol.data.get("deny", [])[:24]) or "(nothing)"
+    confirm = ", ".join(pol.data.get("confirm", [])[:24]) or "(nothing)"
     ask = ", ".join(pol.data.get("ask", [])[:24]) or "(nothing)"
     return f"""You are a coding agent working in {root}.
 
@@ -919,6 +977,7 @@ narrating what you might do next.
 A rule file decides what you may run. Calls that match nothing default to
 `{pol.default_action}`, which puts the call to the user.
 Refused outright: {deny}
+Read out to the user and approved by hand every single time: {confirm}
 Needs the user's approval: {ask}
 A DENIED result is final: do not retry it, and do not reach the same end with a
 different tool. Say what you needed and why, and continue with the rest.{project_notes(root)}"""
@@ -997,6 +1056,9 @@ def run_turn(pol, messages: list, max_steps: int) -> None:
                     return
             if result.startswith("DENIED"):
                 print(red(f"    {result.splitlines()[0]}"))
+                tip = shell_hint(name, args if not err else {}, result)
+                if tip:
+                    print(dim(f"    {tip}"))
             # `_name` is ours: handy in the transcript, stripped before sending,
             # since `name` on a tool message is a legacy shape some servers reject
             messages.append({"role": "tool", "tool_call_id": c.get("id", ""),
@@ -1022,7 +1084,7 @@ def show_rules(pol) -> None:
     for s in pol.sources:
         print(f"  {s}")
     print(f"\n{bold('default for unmatched calls')}: {pol.default_action}")
-    for action in ("deny", "ask", "allow"):
+    for action in pol_mod.ACTIONS:
         rules = pol.data.get(action, [])
         print(f"\n{bold(action)} ({len(rules)})")
         for r in rules:
@@ -1049,7 +1111,8 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list) -> bool:
         else:
             tool, subject = parts[0], parts[1]
             d = pol.check(tool, {pol_mod.SUBJECT.get(tool, "path"): subject})
-            colour = {"deny": red, "ask": yellow, "allow": cyan}[d.action]
+            colour = {"deny": red, "confirm": yellow, "ask": yellow,
+                      "allow": cyan}[d.action]
             print(f"  {tool}({subject}) -> {colour(d.action.upper())}  "
                   f"({d.reason}{'; rule: ' + d.rule if d.rule else ''})")
     elif word == "notes":
@@ -1094,7 +1157,8 @@ def init_policy() -> None:
     if GLOBAL_POLICY.exists():
         sys.exit(f"{GLOBAL_POLICY} already exists; edit it instead")
     doc = {"_readme": [
-        "miniagent rules. Evaluation is deny > ask > allow > default_action.",
+        "miniagent rules. Evaluation is deny > confirm > ask > allow > default_action.",
+        "confirm always asks and is never answerable with `always`.",
         "Rules read tool(pattern): bash(git log*), read_file(**/*.env).",
         "Everything here is added to the built-in defaults; you can only add.",
     ], **{k: v for k, v in pol_mod.DEFAULTS.items()}}

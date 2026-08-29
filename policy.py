@@ -3,10 +3,16 @@
 miniagent policy - the JSON file that decides what the agent is allowed to do.
 
 Rules are strings of the form ``tool(pattern)`` (or bare ``tool`` for every
-call to it) sorted into three buckets: ``deny``, ``ask`` and ``allow``.
-Evaluation is deny-wins:
+call to it) sorted into four buckets: ``deny``, ``confirm``, ``ask`` and
+``allow``.  Evaluation is deny-wins:
 
-    deny  >  ask  >  allow  >  default_action
+    deny  >  confirm  >  ask  >  allow  >  default_action
+
+``deny`` means "not even with the user watching".  ``confirm`` is one step
+down: the call is always put to the user, but the answer is only ever good for
+that one call - there is no "always" to press, so a spare keystroke can never
+quietly retire the rule.  Because ``confirm`` outranks ``allow``, an approval
+saved earlier cannot cover a call that a later ``confirm`` rule describes.
 
 Policies are layered.  Each layer may only *add* rules, so a project file can
 never un-deny something the user's own file forbade:
@@ -40,8 +46,11 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
-ACTIONS = ("deny", "ask", "allow")
-_RANK = {"deny": 0, "ask": 1, "allow": 2}  # lower == more restrictive
+ACTIONS = ("deny", "confirm", "ask", "allow")
+_RANK = {"deny": 0, "confirm": 1, "ask": 2, "allow": 3}  # lower == more restrictive
+
+# Decisions that stop and put the call to the user, rather than answering it.
+ASKING = ("confirm", "ask")
 
 # Which argument carries the thing we are making a decision about.
 SUBJECT = {
@@ -61,20 +70,43 @@ DEFAULTS = {
         "read_file(**/*id_rsa*)",
         "read_file(**/.aws/**)",
         "read_file(**/.ssh/**)",
-        "write_file(.git/**)",
-        "edit_file(.git/**)",
+        "write_file(**/.git/**)",
+        "edit_file(**/.git/**)",
         "bash(rm -rf /*)",
         "bash(rm -rf ~*)",
         "bash(:(){*)",
         "bash(* > /dev/sd*)",
         "bash(sudo *)",
-        "bash(shutdown*)",
         "bash(mkfs*)",
         "bash(dd if=* of=/dev/*)",
-        "bash(git push --force*)",
-        "bash(git push -f*)",
         "bash(*curl*|*sh*)",
         "bash(*wget*|*sh*)",
+    ],
+    # Legitimate, but destructive enough that it is worth reading the exact
+    # command every time.  No "always" is offered for these.
+    #
+    # A flag can be spelled several ways and a glob cannot parse one, so the
+    # spellings people actually type are listed out.  What catches the rest is
+    # `guarded_words` below: a command whose name appears here is never offered
+    # a blanket approval either, so a spelling that slips past this list still
+    # cannot be waved through for good by one keystroke.
+    "confirm": [
+        "bash(rm -rf*)", "bash(rm -fr*)", "bash(rm -Rf*)", "bash(rm -fR*)",
+        "bash(rm -r *)", "bash(rm -R *)",
+        "bash(rm --recursive*)", "bash(rm --force*)",
+        "bash(git push --force*)",
+        "bash(git push -f*)",
+        "bash(git push +*)",
+        "bash(git push * +*)",          # a force push spelled as a refspec
+        "bash(git reset --hard*)",
+        "bash(git clean -f*)",
+        "bash(chmod -R *)",
+        "bash(chown -R *)",
+        "bash(shutdown*)",
+        "bash(reboot*)",
+        # The agent rewriting the rules it is judged by.
+        "write_file(**/.miniagent/**)",
+        "edit_file(**/.miniagent/**)",
     ],
     "ask": [
         "bash(git push*)",
@@ -116,7 +148,7 @@ DEFAULTS = {
 
 
 class Decision(NamedTuple):
-    action: str          # deny | ask | allow
+    action: str          # deny | confirm | ask | allow
     reason: str          # human-readable, shown at the prompt
     rule: str = ""       # the rule that decided it, if any
     subject: str = ""    # the exact path or command segment it judged
@@ -232,11 +264,15 @@ class Glob:
                 row[n] = prev[n]
                 for si in range(n - 1, -1, -1):
                     row[si] = prev[si] or ((arg or subject[si] != "/") and row[si + 1])
-            else:  # SEGS: zero or more `[^/]+/`, and the segment end is forced
+            else:  # SEGS: zero or more `name/`, and the segment end is forced
+                # `si == k` is the empty segment, which only exists at a leading
+                # `/`.  Allowing it is what lets `**/.env` match an absolute
+                # path: the policy judges the string the model sent, and
+                # `/srv/app/.env` and `.env` are the same file.
                 row[n] = prev[n]
                 for si in range(n - 1, -1, -1):
                     k = after[si]
-                    row[si] = prev[si] or (si < k < n and row[k + 1])
+                    row[si] = prev[si] or (si <= k < n and row[k + 1])
         return row[0]
 
 
@@ -372,6 +408,38 @@ class Policy:
                 break
         return worst
 
+    def guarded_prefixes(self) -> set:
+        """What a `confirm` rule speaks for: {"rm", "git push", "chmod", ...}.
+
+        A glob cannot parse a flag, so no list of patterns catches every
+        spelling of `-rf`.  The leading *words* are the durable part: `rm -rfv
+        x` matches no confirm rule, but `rm` is still something this policy has
+        opinions about, and a blanket `bash(rm*)` saved at that prompt would
+        cover every spelling the list happens to miss.
+
+        Flags are dropped, so the prefix is as narrow as the rule is: `git push
+        --force*` guards `git push` and leaves `git commit` alone.
+        """
+        out = set()
+        for raw, tool, _rx, _sep in self._compiled["confirm"]:
+            if tool != "bash" or "(" not in raw:
+                continue
+            head = re.split(r"[*?\[]", raw[raw.index("(") + 1:-1], maxsplit=1)[0]
+            words = []
+            for w in head.split(" "):
+                if not w or not w[0].isalnum():   # a flag, or a `+refspec`
+                    break
+                words.append(w)
+            if words:
+                out.add(" ".join(words))
+        return out
+
+    def guards(self, cmd: str) -> bool:
+        """Does a confirm rule speak for this command, whatever it does?"""
+        words = cmd.split()
+        prefixes = self.guarded_prefixes()
+        return any(" ".join(words[:i]) in prefixes for i in range(1, len(words) + 1))
+
     # -- paths --------------------------------------------------------
     def roots(self, root: Path) -> list[Path]:
         extra = [Path(os.path.expanduser(p)).resolve()
@@ -379,6 +447,27 @@ class Policy:
         return [root, *extra]
 
     # -- persistence --------------------------------------------------
+    def remember_session(self, rule: str) -> str:
+        """Use an allow rule for the rest of this run, without writing it down.
+
+        The default answer to "always": it stops the same question repeating
+        for an hour, and it is gone when the process is, so a decision made in
+        one afternoon's context cannot outlive it.
+        """
+        if not self.data.get("persist_approvals", True):
+            return "remembering approvals is disabled by policy"
+        try:
+            parsed = _parse_rule(rule)
+        except (ValueError, re.error) as e:
+            return f"not remembered, {rule!r} is not a usable rule: {e}"
+        self._apply(rule, parsed)
+        return "allowed for the rest of this session"
+
+    def _apply(self, rule: str, parsed) -> None:
+        if rule not in self.data.setdefault("allow", []):
+            self.data["allow"].append(rule)
+            self._compiled["allow"].append((rule, *parsed))
+
     def remember(self, path: Path, rule: str) -> str:
         """Append an allow rule to a policy file and use it from now on."""
         if not self.data.get("persist_approvals", True):
@@ -402,8 +491,7 @@ class Policy:
             path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
         except OSError as e:
             return f"not saved: {e}"
-        self.data.setdefault("allow", []).append(rule)
-        self._compiled["allow"].append((rule, *parsed))
+        self._apply(rule, parsed)
         return f"saved to {path}"
 
 
@@ -424,8 +512,14 @@ def _parse_rule(rule: str):
 
 
 def _stricter(a: str, b: str) -> str:
-    """Whichever of two actions grants less."""
-    return a if _RANK.get(a, 1) <= _RANK.get(b, 1) else b
+    """Whichever of two actions grants less.
+
+    An unrecognised action is ranked as `ask`, so it can never come out of here
+    looking stricter than something real.  `validate` rejects it first anyway;
+    this is what keeps that true if the two ever drift apart.
+    """
+    unknown = _RANK["ask"]
+    return a if _RANK.get(a, unknown) <= _RANK.get(b, unknown) else b
 
 
 def _merge_limits(base: dict, extra: dict, trusted: bool) -> dict:
@@ -519,6 +613,10 @@ def validate(doc: dict, where: str) -> None:
     Policy.__init__ catches the same mistakes, but by then the layers have been
     merged and it can no longer say which file to go and fix.
     """
+    want = doc.get("default_action")
+    if want is not None and want not in ACTIONS:
+        raise SystemExit(f"{where}: default_action is {want!r}, "
+                         f"which is not one of {ACTIONS}")
     for action in ACTIONS:
         rules = doc.get(action)
         if rules is None:

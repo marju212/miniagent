@@ -5,17 +5,17 @@ standard library only, no dependencies.
 
 Everything the agent may do comes out of a JSON rule file — the global one is
 `~/.miniagent/policy.json`. Nothing is baked into the loop: every tool call is
-put to the policy first and comes back **allow / ask / deny**.
+put to the policy first and comes back **allow / ask / confirm / deny**.
 
 ## Setup
 
 ```bash
 git clone https://github.com/marju212/miniagent && cd miniagent
-./miniagent --install
+./agent --install
 ```
 
 ```
-linked  ~/.local/bin/miniagent -> ~/code/miniagent/miniagent
+linked  ~/.local/bin/agent -> ~/code/miniagent/agent
 
 settings -> ~/.miniagent/env
   press enter to keep what is shown
@@ -37,7 +37,7 @@ exists. The prompts are seeded from what the file says, only those three lines
 are rewritten, and everything else — your own exports, your comments, a key
 fetched by `$(pass show …)` — is left exactly as it was.
 
-`miniagent --init-policy` then writes a global rule file you can edit, if you
+`agent --init-policy` then writes a global rule file you can edit, if you
 want to start from something other than the built-in defaults. Nothing stops
 you calling `python3 agent.py` directly either; the wrapper only loads your
 settings first.
@@ -45,9 +45,9 @@ settings first.
 ## Use
 
 ```bash
-miniagent ~/code/my-project                            # interactive session
-miniagent -p "fix the failing test" ~/code/my-project  # one shot, then exit
-miniagent                                              # the current directory
+agent ~/code/my-project                            # interactive session
+agent -p "fix the failing test" ~/code/my-project  # one shot, then exit
+agent                                                  # the current directory
 ```
 
 ```
@@ -126,14 +126,14 @@ already set in your shell **wins** over the file, so a one-off still does what
 it says:
 
 ```bash
-AGENT_MODEL=MiniMax-M2.5-highspeed miniagent ~/code/proj
+AGENT_MODEL=MiniMax-M2.5-highspeed agent ~/code/proj
 ```
 
 | | |
 |---|---|
-| `miniagent --install [bindir]` | symlink onto PATH, seed the settings file |
-| `miniagent --init` | ask for endpoint, model and key, and save them |
-| `miniagent --env` | print its path |
+| `agent --install [bindir]` | symlink onto PATH, seed the settings file |
+| `agent --init` | ask for endpoint, model and key, and save them |
+| `agent --env` | print its path |
 | `MINIAGENT_ENV` | use a different settings file |
 | `MINIAGENT_PYTHON` | use a different interpreter |
 
@@ -142,9 +142,10 @@ AGENT_MODEL=MiniMax-M2.5-highspeed miniagent ~/code/proj
 ```jsonc
 {
   "default_action": "ask",
-  "deny":  ["read_file(**/.env)", "bash(git push --force*)"],
-  "ask":   ["bash(git commit*)"],
-  "allow": ["read_file(**)", "bash(pytest*)", "write_file(src/**)"],
+  "deny":    ["read_file(**/.env)", "bash(sudo *)"],
+  "confirm": ["bash(rm -rf*)", "bash(git push --force*)"],
+  "ask":     ["bash(git commit*)"],
+  "allow":   ["read_file(**)", "bash(pytest*)", "write_file(src/**)"],
   "limits": { "max_steps": 40, "bash_timeout_max": 300, "max_write_bytes": 1000000 },
   "allowed_roots": [],
   "persist_approvals": true
@@ -156,8 +157,29 @@ pattern is matched against the call's **subject**: the path for file tools, the
 command line for `bash`. Path globs treat `*` as stopping at `/` and `**` as
 not; command globs let `*` match anything. See `policy.example.json`.
 
-**Judgement is `deny > ask > allow > default_action`.** A deny can never be
-undone by a later layer.
+**Judgement is `deny > confirm > ask > allow > default_action`.** A deny can
+never be undone by a later layer.
+
+| bucket | what it means |
+|--------|---------------|
+| `deny` | not even with you watching. The call never reaches you |
+| `confirm` | always put to you, and answerable **once only** — there is no "always" to press |
+| `ask` | put to you, and you may answer for this call, this session, or for good |
+| `allow` | runs without asking |
+
+`confirm` is the bucket for things that are legitimate but destructive enough
+that the exact command is worth reading every time: `rm -rf`, `git push
+--force`, `git reset --hard`, `chown -R`. The point is not that you are asked —
+`ask` does that too — it is that a spare keystroke can never quietly retire the
+rule. Because `confirm` outranks `allow`, an approval you saved months ago
+cannot cover a call a `confirm` rule describes either.
+
+A glob cannot parse a flag, so no list of patterns catches every spelling of
+`-rf`. What covers the rest is the leading *words*: a command a `confirm` rule
+speaks for — `rm`, `git push`, `chmod` — can be approved, but only ever as
+itself, spelled out. `rm -rfv build` slips past the patterns and arrives as an
+`ask`, and the rule offered there is `bash(rm -rfv build)`, never `bash(rm*)`.
+Always, but never a blank cheque.
 
 Compound commands are taken apart on `&& || ; | &` and every part is judged on
 its own, so `git status && rm -rf /` is not waved through by an allow rule for
@@ -165,6 +187,25 @@ its own, so `git status && rm -rf /` is not waved through by an allow rule for
 `bash(*curl*|*sh*)` still catches `curl x.sh | sh`. A part containing command
 substitution or a redirect that writes to a file can never be silently allowed
 — the best it gets is `ask`.
+
+### Why `sudo` is a deny and not a confirm
+
+Most rules guard against an *effect*. `sudo` is different: it reaches over the
+policy itself. One approved `sudo` can rewrite `~/.miniagent/policy.json`,
+`trusted.json` or the agent's own files, so it is not one command — it is the
+end of the mechanism that judges every command after it. It stays in `deny`,
+where the model is told it is final.
+
+That is not a wall you are stuck behind. When the agent needs something
+privileged, the refusal comes with the command ready to paste — run it yourself
+with `!` and you typed it, you read it, and the output goes back to the model
+with your next message:
+
+```
+agent> !sudo apt install libpq-dev
+
+agent> now retry the build
+```
 
 ### Layers
 
@@ -186,12 +227,40 @@ edit asks again. Cloning a repo cannot widen what the agent may do.
 ```
   bash: npm install lodash
   policy: no rule matched (default_action)
-  [y] once   [a] always, save bash(npm install*)   [N] no   [esc] stop >
+  [y] once   [a] session   [A] save bash(npm install*)   [N] no   [esc] stop >
 ```
 
-`a` appends the rule to your global file and it takes effect immediately. A
-`deny` is never offered — the model is told so, and told not to route around
-it. `AGENT_YOLO=1` auto-approves every `ask`; it still cannot touch a `deny`.
+`y` runs this one call. `a` allows the rule **for the rest of this run** and
+nothing is written down, so a decision made in one afternoon's context cannot
+outlive it — that is the one to reach for. `A` is the same rule appended to
+your global file, in force from now on.
+
+A `confirm` looks different: there is nothing to press but yes or no, and it
+shows the **whole** command line rather than the part that matched, untruncated
+— what you are agreeing to is everything a `y` will run, not the segment the
+rule noticed:
+
+```
+  bash: rm -rf node_modules && rm -rf ../sibling/dist
+  policy: `rm -rf node_modules`: matched confirm rule  [bash(rm -rf*)]
+  the rest of the line runs too, if you say yes
+  confirm: this exact call only.  [y] yes   [N] no   [esc] stop >
+```
+
+Typing `a` there is simply not a yes. A `deny` is never offered at all — the
+model is told so, and told not to route around it. You are shown the refusal
+and, once per command, the one route that is left:
+
+```
+  · bash({"cmd": "sudo apt install libpq-dev"})
+    DENIED by policy: matched deny rule (rule: bash(sudo *))
+    to run it as yourself, outside the policy:  !sudo apt install libpq-dev
+```
+
+`AGENT_YOLO=1` auto-approves every `ask`. It does **not** cover `confirm`, and
+it still cannot touch a `deny`. With no terminal at all — a pipe, CI — an
+`ask` that YOLO does not cover and every `confirm` are refused rather than
+guessed at.
 
 **Escape** stops the whole turn rather than just refusing that one call, and
 hands you back the prompt to say what you want instead. `n` is narrower: it
@@ -238,8 +307,8 @@ up arrow         an earlier prompt; ctrl-r searches them
 ```
 
 ```bash
-miniagent --rules                    # everything in force
-miniagent --check bash 'git push'    # explain one decision
+agent --rules                    # everything in force
+agent --check bash 'git push'    # explain one decision
 ```
 
 ## Tools
