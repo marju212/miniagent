@@ -721,7 +721,45 @@ class Approving(unittest.TestCase):
     def test_an_ask_offers_both_a_session_and_a_saved_approval(self):
         _, screen, _ = self.ask(self.plain())
         self.assertIn("[a] session", screen)
-        self.assertIn("[A] save", screen)
+        self.assertIn("[g] global", screen)
+
+    def test_the_rule_to_be_saved_is_on_its_own_line_not_among_the_choices(self):
+        # `g` writes it to disk, so it has to be read before it is chosen - and
+        # inline it pushed [N] and [esc] sideways by the length of the rule.
+        _, screen, _ = self.ask(self.plain())
+        rule = [l for l in screen.splitlines() if "saves as:" in l]
+        self.assertEqual(len(rule), 1, screen)
+        self.assertIn("bash(frobnicate x*)", rule[0])
+        choices = [l for l in screen.splitlines() if "[y] once" in l][0]
+        self.assertNotIn("frobnicate", choices)
+
+    def test_a_bare_enter_is_a_no(self):
+        # Nothing typed is what read_answer hands back for a bare return. It
+        # is not a `y`, so it must not run - that is what [N]'s capital says.
+        ok, _, pol = self.ask(self.plain(), typed="")
+        self.assertFalse(ok)
+        self.assertEqual(pol.check("bash", {"cmd": "frobnicate x"}).action, "ask")
+
+    def test_g_saves_the_rule_where_the_next_session_will_read_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = Path(tmp) / "policy.json"
+            with _patch(agent, "GLOBAL_POLICY", saved):
+                ok, screen, pol = self.ask(self.plain(), typed="g")
+            self.assertTrue(ok)
+            self.assertIn("bash(frobnicate x*)", saved.read_text())
+        self.assertEqual(pol.check("bash", {"cmd": "frobnicate x"}).action, "allow")
+
+    def test_a_stale_capital_a_is_the_narrower_of_the_two_not_the_wider(self):
+        # `A` used to mean "save globally" and `a` "this session": one slipped
+        # shift wrote a permanent rule. Now that they are told apart by letter,
+        # the old keystroke has to land on the *less* permissive of the two.
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = Path(tmp) / "policy.json"
+            with _patch(agent, "GLOBAL_POLICY", saved):
+                ok, screen, _ = self.ask(self.plain(), typed="A")
+            self.assertTrue(ok)
+            self.assertIn("rest of this session", screen)
+            self.assertFalse(saved.exists())
 
     def test_a_confirm_shows_the_whole_line_not_just_the_part_that_matched(self):
         # `rm -rf a && rm -rf ../b` matches on the first segment, but a `y`
@@ -763,11 +801,12 @@ class Approving(unittest.TestCase):
         ok, screen, _ = self.ask(self.confirm())
         self.assertTrue(ok)
         self.assertNotIn("[a]", screen)
-        self.assertNotIn("[A]", screen)
+        self.assertNotIn("[g]", screen)
+        self.assertNotIn("saves as:", screen)
         self.assertIn("this exact call only", screen)
 
     def test_pressing_a_at_a_confirm_is_not_a_yes(self):
-        for typed in ("a", "A", "always"):
+        for typed in ("a", "A", "always", "g", "global"):
             with self.subTest(typed=typed):
                 ok, _, pol = self.ask(self.confirm(), typed=typed)
                 self.assertFalse(ok)

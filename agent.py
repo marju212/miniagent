@@ -495,9 +495,12 @@ def proposed_change(tool: str, args: dict):
 def approve(pol, tool: str, args: dict, d) -> bool:
     """Put an `ask` or `confirm` decision to the user.  True to run it once.
 
-    A `confirm` decision is answerable once and only once: no `a`, no `A`, and
+    A `confirm` decision is answerable once and only once: no `a`, no `g`, and
     AGENT_YOLO does not cover it.  The point of that bucket is that a person
     reads the exact command every time, which a blanket yes would undo.
+
+    Answering is line based, so a bare enter is an answer: it is not `y`, so
+    it is a no.  That is what the capital in `[N]` is there to say.
     """
     # What runs is the whole call; `d.subject` is only the part of it that the
     # rule matched.  Showing the segment alone would mean `rm -rf a && rm -rf
@@ -529,18 +532,25 @@ def approve(pol, tool: str, args: dict, d) -> bool:
     if once_only:
         choices = f"  {yellow('confirm')}: this exact call only.  [y] yes   "
     else:
-        choices = (f"  [y] once   [a] session   [A] save {cyan(rule)}   ")
+        # On its own line, not in with the choices: `g` writes this to disk to
+        # be obeyed from now on, so it has to be readable before it is chosen -
+        # and inline it made the choices shift sideways with every rule.
+        print(dim("  saves as: ") + cyan(rule))
+        choices = "  [y] once   [a] session   [g] global   "
     ans = read_answer(choices + "[N] no   [esc] stop > ")
     if ans is None:
         raise Interrupted
-    ans = ans.strip()
+    # Case folded, because `a` and `A` used to be session and global: one
+    # slipped shift wrote a permanent rule.  They are told apart by letter
+    # now, so a stale `A` can only mean the narrower of the two.
+    ans = ans.strip().lower()
     if not once_only and ans in ("a", "always"):
         print(dim("  " + pol.remember_session(rule)))
         return True
-    if not once_only and ans == "A":
+    if not once_only and ans in ("g", "global"):
         print(dim("  " + pol.remember(GLOBAL_POLICY, rule)))
         return True
-    return ans.lower() in ("y", "yes")
+    return ans in ("y", "yes")
 
 
 def call_tool(pol, name: str, args: dict) -> tuple:

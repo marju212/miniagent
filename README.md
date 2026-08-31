@@ -238,13 +238,20 @@ edit asks again. Cloning a repo cannot widen what the agent may do.
 ```
   bash: npm install lodash
   policy: no rule matched (default_action)
-  [y] once   [a] session   [A] save bash(npm install*)   [N] no   [esc] stop >
+  saves as: bash(npm install*)
+  [y] once   [a] session   [g] global   [N] no   [esc] stop >
 ```
 
 `y` runs this one call. `a` allows the rule **for the rest of this run** and
 nothing is written down, so a decision made in one afternoon's context cannot
-outlive it — that is the one to reach for. `A` is the same rule appended to
-your global file, in force from now on.
+outlive it — that is the one to reach for. `g` is the same rule appended to
+your global file, in force from now on; the `saves as:` line is what both of
+them would save, on its own line because `g` outlives the session that chose
+it and should be read first.
+
+Answering is line based, so **enter on its own is a no** — it is not a `y`,
+which is what the capital in `[N]` is there to say. `esc` stops the turn
+instead of answering it.
 
 A write shows what it would do before you answer, so `y` is not a guess:
 
@@ -257,7 +264,8 @@ A write shows what it would do before you answer, so `y` is not a guess:
   +    if token and not expired(token):
            return claims(token)
   +1 -1
-  [y] once   [a] session   [A] save edit_file(auth.py)   [N] no   [esc] stop >
+  saves as: edit_file(auth.py)
+  [y] once   [a] session   [g] global   [N] no   [esc] stop >
 ```
 
 Nothing is written to work the diff out, and nothing large is read to work out
@@ -278,7 +286,8 @@ rule noticed:
   confirm: this exact call only.  [y] yes   [N] no   [esc] stop >
 ```
 
-Typing `a` there is simply not a yes. A `deny` is never offered at all — the
+Typing `a` or `g` there is simply not a yes, and there is no `saves as:`
+line, because there is nothing a `confirm` can be saved as. A `deny` is never offered at all — the
 model is told so, and told not to route around it. You are shown the refusal
 and, once per command, the one route that is left:
 
