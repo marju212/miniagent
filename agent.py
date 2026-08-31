@@ -39,10 +39,12 @@ import ui
 # Re-exported so the rest of this file - and the tests - can go on calling
 # them unqualified.  `approve` and `shell_escape` deliberately stayed here,
 # so `ui.read_answer` has to be reachable as a module global of this module
-# for a test to be able to swap it out.
-from ui import (BAR, Interrupted, StatusBar, bold, cyan, dim, emit, green,
-                prompt_text, read_answer, red, termios, warn, yellow,
-                _clip, _short, _TTY)
+# for a test to be able to swap it out.  `StatusBar` and `termios` look unused
+# here and are not: the tests reach them through this module.  Nothing that is
+# only *read* at import time belongs in this list - `_TTY` was, and a test
+# setting `agent._TTY` changed nothing, since ui's colours read ui's copy.
+from ui import (BAR, Interrupted, StatusBar, bold, cyan, dim, prompt_text,
+                read_answer, red, termios, warn, yellow, _clip, _short)
 
 try:
     # Importing it is the whole trick: input() then routes through readline,
@@ -467,8 +469,15 @@ def proposed_change(tool: str, args: dict):
         return None
     try:
         p = resolve(str(args.get("path") or ""))
-        before = p.read_text(encoding="utf-8") if p.is_file() else ""
-        if "\0" in before or len(before) > int(LIMITS.get("max_write_bytes", 10**6)):
+        cap = int(LIMITS.get("max_write_bytes", 10**6))
+        before = ""
+        if p.is_file():
+            # Sized first: reading a multi-gigabyte file into memory only to
+            # decide it is too big to diff would stall the prompt.
+            if p.stat().st_size > cap:
+                return None
+            before = p.read_text(encoding="utf-8")
+        if "\0" in before:
             return None
         if tool == "write_file":
             return _rel(p), before, str(args.get("content") or "")
@@ -521,7 +530,7 @@ def approve(pol, tool: str, args: dict, d) -> bool:
         choices = f"  {yellow('confirm')}: this exact call only.  [y] yes   "
     else:
         choices = (f"  [y] once   [a] session   [A] save {cyan(rule)}   ")
-    ans = read_answer(choices + f"[N] no   [esc] stop > ")
+    ans = read_answer(choices + "[N] no   [esc] stop > ")
     if ans is None:
         raise Interrupted
     ans = ans.strip()
@@ -665,10 +674,15 @@ def wire(messages: list) -> list:
     return out
 
 
+def transcript_size(messages: list) -> int:
+    """Roughly what the transcript costs to send, in characters."""
+    return sum(len(json.dumps(m, default=str)) for m in messages)
+
+
 def compact(messages: list, budget: int, keep_last: int = 8) -> int:
     """Shrink the oldest tool results once the transcript outgrows the budget.
     Messages are never dropped, so tool_call/tool pairs stay intact."""
-    size = sum(len(json.dumps(m, default=str)) for m in messages)
+    size = transcript_size(messages)
     if size <= budget:
         return 0
     freed = 0
@@ -692,8 +706,10 @@ class Usage:
     def __init__(self):
         self.prompt = self.completion = self.calls = 0
 
-    def add(self, u: dict) -> None:
+    def add(self, u) -> None:
         self.calls += 1
+        if not isinstance(u, dict):     # a provider answering with a list
+            return
         self.prompt += int(u.get("prompt_tokens") or 0)
         self.completion += int(u.get("completion_tokens") or 0)
 
@@ -781,9 +797,35 @@ def explain(code: int, text: str) -> str:
     return f"API error {code}: {_short(text, 200)}"
 
 
+def _shape(body: dict) -> dict:
+    """The assistant message out of a response, or an ApiError saying why not.
+
+    Everything here is a value a server chose, so nothing about its shape can
+    be assumed.  A wrong type has to come back as an ApiError like any other
+    refusal: an AttributeError would escape run_turn and end the session with
+    the transcript still in it - the one thing the caller must never lose.
+    """
+    choices = body.get("choices") or []
+    if not choices:
+        raise ApiError("no completion returned: "
+                       f"{_short(json.dumps(body), 200)}")
+    if not isinstance(choices, list) or not isinstance(choices[0], dict):
+        raise ApiError(f"{BASE_URL} answered with a malformed `choices`: "
+                       f"{_short(json.dumps(body), 200)}")
+    msg = choices[0].get("message") or {}
+    if not isinstance(msg, dict):
+        raise ApiError(f"{BASE_URL} answered with a malformed `message`: "
+                       f"{_short(json.dumps(body), 200)}")
+    msg = dict(msg)
+    msg.setdefault("role", "assistant")
+    return msg
+
+
 def llm(messages: list, tools: list) -> dict:
     last = "no attempt was made"
-    for attempt in range(max(1, RETRIES)):
+    tries = max(1, RETRIES)
+    attempt = 0                 # counts *failures*, not requests; see `dropped`
+    while attempt < tries:
         req = urllib.request.Request(
             f"{BASE_URL}/chat/completions",
             data=json.dumps(_payload(messages, tools)).encode(),
@@ -797,19 +839,25 @@ def llm(messages: list, tools: list) -> dict:
             text = e.read().decode("utf-8", "replace")[:800]
             dropped = _drop_rejected(e.code, text)
             if dropped:
+                # Not a failed attempt: the next request is a different one, so
+                # spending the budget here would mean announcing a retry that
+                # never happens - which is exactly what AGENT_RETRIES=1 did.
+                # It terminates because _drop_rejected pops, so EXTRAS shrinks.
                 warn(f"the server rejected `{dropped}`, retrying without it")
                 continue
             last = explain(e.code, text)
-            if e.code in RETRY_CODES and attempt + 1 < RETRIES:
-                _backoff(attempt, f"HTTP {e.code}")
+            attempt += 1
+            if e.code in RETRY_CODES and attempt < tries:
+                _backoff(attempt - 1, f"HTTP {e.code}")
                 continue
             raise ApiError(last, e.code)
         except json.JSONDecodeError as e:
             # A proxy or a login page answering where the API should be - or
             # a body that was cut short, which is worth another go.
             last = f"{BASE_URL} did not return JSON (is it a /v1 endpoint?)"
-            if attempt + 1 < RETRIES:
-                _backoff(attempt, f"{type(e).__name__}: {e}")
+            attempt += 1
+            if attempt < tries:
+                _backoff(attempt - 1, f"{type(e).__name__}: {e}")
                 continue
             raise ApiError(last)
         # HTTPException is not an OSError: a response cut short raises
@@ -817,8 +865,9 @@ def llm(messages: list, tools: list) -> dict:
         except (urllib.error.URLError, TimeoutError, OSError,
                 http.client.HTTPException) as e:
             last = f"cannot reach {BASE_URL}: {e}"
-            if attempt + 1 < RETRIES:
-                _backoff(attempt, f"{type(e).__name__}: {e}")
+            attempt += 1
+            if attempt < tries:
+                _backoff(attempt - 1, f"{type(e).__name__}: {e}")
                 continue
             raise ApiError(last)
 
@@ -828,24 +877,23 @@ def llm(messages: list, tools: list) -> dict:
 
         # MiniMax reports auth and quota failures inside a 200 response.
         resp = body.get("base_resp") or {}
+        if not isinstance(resp, dict):
+            raise ApiError(f"{BASE_URL} answered with a malformed `base_resp`: "
+                           f"{_short(json.dumps(body), 200)}")
         code = resp.get("status_code")
         if code:
             why, again = MINIMAX_CODES.get(
                 code, (resp.get("status_msg") or "the request was refused", False))
             last = f"{why} (MiniMax {code})"
-            if again and attempt + 1 < RETRIES:
-                _backoff(attempt, why)
+            attempt += 1
+            if again and attempt < tries:
+                _backoff(attempt - 1, why)
                 continue
             raise ApiError(last, code)
-        choices = body.get("choices") or []
-        if not choices:
-            raise ApiError("no completion returned: "
-                           f"{_short(json.dumps(body), 200)}")
-        USAGE.add(body.get("usage") or {})
-        msg = choices[0].get("message") or {}
-        msg.setdefault("role", "assistant")
+        msg = _shape(body)
+        USAGE.add(body.get("usage"))
         return msg
-    raise ApiError(f"gave up after {RETRIES} failed requests: {last}")
+    raise ApiError(f"gave up after {tries} failed requests: {last}")
 
 
 def _backoff(attempt: int, why: str) -> None:
@@ -1092,9 +1140,18 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list,
     elif word == "compact":
         # Half the budget, so it frees something rather than only enough to
         # get back under a limit the next message would cross again.
-        freed = compact(messages, CONTEXT_CHARS // 2)
-        print(f"  freed {freed:,} chars" if freed
-              else "  nothing left to shrink; /clear starts fresh")
+        budget = CONTEXT_CHARS // 2
+        size = transcript_size(messages)
+        if size <= budget:
+            # Nothing *needed* shrinking. Saying "nothing left to shrink" here
+            # and offering /clear would read as an out-of-room warning on a
+            # conversation with plenty of room left.
+            print(f"  nothing to shrink: {size:,} chars, well inside the "
+                  f"{CONTEXT_CHARS:,} the model is given")
+        else:
+            freed = compact(messages, budget)
+            print(f"  freed {freed:,} chars" if freed
+                  else "  nothing left to shrink; /clear starts fresh")
     elif word in ("reset", "clear"):
         del messages[1:]
         messages[0] = {"role": "system", "content": system}

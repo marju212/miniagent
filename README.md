@@ -257,10 +257,11 @@ A write shows what it would do before you answer, so `y` is not a guess:
   [y] once   [a] session   [A] save edit_file(auth.py)   [N] no   [esc] stop >
 ```
 
-Nothing is written to work the diff out. A binary file, a path outside the
-working directory, or an `old` string that matches more than once shows no
-preview — the last of those says so, since it is also why the call is about to
-fail. `AGENT_DIFF_LINES` caps the length, default 24; `0` turns it off.
+Nothing is written to work the diff out, and nothing large is read to work out
+that it is too large. A binary file, a file over the write limit, a path
+outside the working directory, or an `old` string that matches more than once
+shows no preview — the last of those says so, since it is also why the call is
+about to fail. `AGENT_DIFF_LINES` caps the length, default 24; `0` turns it off.
 
 A `confirm` looks different: there is nothing to press but yes or no, and it
 shows the **whole** command line rather than the part that matched, untruncated

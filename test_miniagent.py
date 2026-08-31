@@ -865,6 +865,48 @@ class Recoverable(unittest.TestCase):
                     with self.assertRaises(agent.ApiError):
                         self.ask()
 
+    def test_a_body_of_the_wrong_shape_inside_is_a_refusal_too(self):
+        # isinstance(body, dict) only guards the outside. A choice, a message
+        # or a base_resp of the wrong type used to raise AttributeError, which
+        # is not an ApiError - so it went straight past run_turn and ended the
+        # session with the conversation still in it.
+        for doc in ({"choices": ["oops"]},
+                    {"choices": {"one": 1}},
+                    {"choices": [{"message": "hi"}]},
+                    {"base_resp": "boom"}):
+            with self.subTest(doc=doc):
+                FAULTS.clear()
+                FAULTS.append((200, doc))
+                with self.assertRaises(agent.ApiError):
+                    self.ask()
+
+    def test_a_provider_counting_usage_wrongly_is_not_fatal(self):
+        FAULTS.append((200, {"choices": [{"message": {"content": "hi"}}],
+                             "usage": []}))
+        self.assertEqual(self.ask()["content"], "hi")
+
+    def test_dropping_a_rejected_field_actually_retries(self):
+        # The drop is announced as a retry, so a retry has to happen. Counting
+        # it against the budget meant AGENT_RETRIES=1 gave up immediately,
+        # having sent the only request it was ever going to send.
+        FAULTS.append((400, {"error": {"message": 'unknown field "reasoning"'}}))
+        with _patch(agent, "EXTRAS", {"reasoning": {"effort": "high"}}), \
+                _patch(agent, "RETRIES", 1):
+            with contextlib.redirect_stderr(io.StringIO()):
+                got = self.ask()
+        self.assertEqual(got["content"], "done")
+        self.assertEqual(len(REQUESTS), 2)          # with it, then without it
+        self.assertIn("reasoning", REQUESTS[0])
+        self.assertNotIn("reasoning", REQUESTS[1])
+
+    def test_giving_up_says_what_actually_went_wrong(self):
+        FAULTS.extend([(500, {"error": "boom"})] * 4)
+        with _patch(agent, "RETRIES", 2):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(agent.ApiError) as caught:
+                    self.ask()
+        self.assertNotIn("no attempt was made", str(caught.exception))
+
     def test_the_transcript_survives_a_failed_turn(self):
         FAULTS.append((500, {"error": "boom"}))
         msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
@@ -974,6 +1016,56 @@ class Showing(unittest.TestCase):
         with _patch(agent, "ROOTS", [root]):
             agent.proposed_change("write_file", {"path": "f.txt", "content": "z\n"})
         self.assertEqual((root / "f.txt").read_text(encoding="utf-8"), "a\n")
+
+    def test_a_read_summary_stays_one_line_however_the_file_ends(self):
+        # _clip leaves `...[N chars cut from the middle]...` *inside* the
+        # result. Hunting for the last `...[` found that one whenever the file
+        # ended in `]`, and pasted the whole tail - thousands of characters of
+        # the file - onto what is meant to be a one-line summary.
+        root = Path(tempfile.mkdtemp()).resolve()
+        body = json.dumps([{"id": i, "name": "x" * 200} for i in range(120)],
+                          indent=1)
+        (root / "big.json").write_text(body, encoding="utf-8")
+        self.assertTrue(body.rstrip().endswith("]"))
+        with _patch(agent, "ROOTS", [root]):
+            result = agent._clip(agent.t_read("big.json"), 20_000)
+        self.assertIn("chars cut from the middle", result)   # it was clipped
+        line, = ui.tool_result("read_file", result)
+        self.assertNotIn("\n", line)
+        self.assertLess(len(line), 100, line)
+        self.assertIn("clipped", line)      # so the count is not read as the file
+
+    def test_a_read_that_stopped_early_still_says_how_much_is_left(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "long.txt").write_text(
+            "\n".join(f"line {i}" for i in range(3000)), encoding="utf-8")
+        with _patch(agent, "ROOTS", [root]):
+            line, = ui.tool_result("read_file", agent.t_read("long.txt"))
+        self.assertIn("1000 more lines", line)
+        self.assertIn("2000 lines", line)   # the marker is not counted as one
+
+    def test_an_empty_result_is_not_an_index_error(self):
+        for result in ("", "   ", "\n"):
+            with self.subTest(result=result):
+                self.assertEqual(ui.tool_result("write_file", result), [])
+
+    def test_a_file_too_big_to_diff_is_not_read_to_find_that_out(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        huge = root / "huge.txt"
+        huge.write_bytes(b"a\n" * 40_000)
+        opened = []
+        real = Path.read_text
+
+        def watched(self, *a, **k):
+            opened.append(self.name)
+            return real(self, *a, **k)
+
+        with _patch(agent, "ROOTS", [root]), \
+                _patch(agent, "LIMITS", {**agent.LIMITS, "max_write_bytes": 1000}), \
+                _patch(Path, "read_text", watched):
+            self.assertIsNone(agent.proposed_change(
+                "write_file", {"path": "huge.txt", "content": "x"}))
+        self.assertEqual(opened, [], "the oversized file was read anyway")
 
     def test_a_path_outside_the_sandbox_is_simply_not_previewed(self):
         root = Path(tempfile.mkdtemp()).resolve()
@@ -1226,6 +1318,29 @@ class ShellEscapeMishaps(unittest.TestCase):
             agent.slash(make_policy(), "/reset", msgs, "s", mine)
         self.assertEqual(mine, [], "/reset said it forgot the conversation")
         self.assertEqual(len(msgs), 1)
+
+    def test_compact_does_not_cry_wolf_on_a_short_conversation(self):
+        # compact() returns 0 both when there is nothing shrinkable left and
+        # when nothing needed shrinking. Reporting the second as the first read
+        # as an out-of-room warning, and offered to wipe a conversation that
+        # had all the room in the world.
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.slash(make_policy(), "/compact", msgs, "s", [])
+        said = out.getvalue()
+        self.assertIn("nothing to shrink", said)
+        self.assertNotIn("/clear", said)
+
+    def test_compact_shrinks_a_fat_conversation_and_says_by_how_much(self):
+        msgs = [{"role": "system", "content": "s"}]
+        msgs += [{"role": "tool", "tool_call_id": str(i), "content": "z" * 40_000}
+                 for i in range(30)]
+        before = agent.transcript_size(msgs)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.slash(make_policy(), "/compact", msgs, "s", [])
+        self.assertIn("freed", out.getvalue())
+        # the newest few are left alone, so this shrinks rather than fits
+        self.assertLess(agent.transcript_size(msgs), before // 2)
 
 
 class Bar(unittest.TestCase):

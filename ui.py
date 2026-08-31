@@ -5,11 +5,13 @@ Kept apart from agent.py so the loop can be read without the terminal
 handling, and so this can be tested on its own.  It imports nothing from
 agent.py or policy.py; that is what keeps the split acyclic.
 
-Every write to the terminal goes through emit(), which holds a lock.  The
-reason is DECSC/DECRC (\0337 / \0338): a terminal has *one* cursor save slot,
-so two writers interleaving a save/restore pair corrupt each other.  The
-status bar, the working indicator and the streamed reply all write from
-different places, and one funnel is what keeps them apart.
+Ordinary lines are printed.  The escape sequences that move the cursor go
+through emit() instead, which holds a re-entrant lock.  The reason is
+DECSC/DECRC (\0337 / \0338): a terminal has *one* cursor save slot, so two
+writers interleaving a save/restore pair corrupt each other.  The status bar
+draws from the prompt loop and gives its row back from a signal handler, which
+can fire in the middle of that draw - the lock is what keeps the two apart,
+and it is re-entrant because a handler runs on the thread it interrupted.
 """
 
 import atexit
@@ -17,6 +19,7 @@ import codecs
 import difflib
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -338,6 +341,14 @@ def _fit_block(lines: list, room: int, prefer_tail: bool) -> list:
     return lines[:head] + [f"…{gap} more lines…"] + (lines[-tail:] if tail else [])
 
 
+# t_read's own tail marker, and only that: anchored at the end and shaped like
+# `...[N more lines]`.  Matching a bare `...[` anywhere would also hit the one
+# _clip leaves in the *middle* of an oversized result, and everything after it
+# - thousands of characters of file - would be pasted onto the summary line.
+_MORE_LINES = re.compile(r"\n\.\.\.\[\d+ more lines\]\s*\Z")
+_CUT_OUT = "chars cut from the middle]"
+
+
 def tool_result(name: str, result: str, seconds: float = 0.0,
                 max_lines: int = 6) -> list:
     """A few dim lines saying what the call actually did.
@@ -345,7 +356,7 @@ def tool_result(name: str, result: str, seconds: float = 0.0,
     Reads the already-clipped string the model was given, so what is on the
     screen can never claim more than what was sent.
     """
-    if not max_lines or result.startswith("DENIED"):
+    if not max_lines or not result.strip() or result.startswith("DENIED"):
         return []                       # DENIED is printed in red by the caller
     room = max(20, shutil.get_terminal_size().columns - 6)
     took = f"  {seconds:.1f}s" if seconds >= 1.0 else ""
@@ -365,11 +376,13 @@ def tool_result(name: str, result: str, seconds: float = 0.0,
         return out
 
     if name == "read_file":
-        n = len(result.splitlines())
-        more = ""
-        if result.rstrip().endswith("]") and "...[" in result:
-            more = result[result.rfind("...["):].strip()
-        return ["    " + dim(f"{n} lines{(' ' + more) if more else ''}{took}")]
+        m = _MORE_LINES.search(result)
+        more = " " + m.group(0).strip() if m else ""
+        n = len(result.splitlines()) - (1 if m else 0)
+        # A clipped result is missing its middle, so `n` is how much came back
+        # rather than how long the file is; say so instead of implying it.
+        cut = " (clipped)" if _CUT_OUT in result else ""
+        return ["    " + dim(_fit(f"{n} lines{cut}{more}{took}", room))]
 
     # write_file / edit_file already say +N -M themselves
     return ["    " + dim(_fit(result.splitlines()[0], room) + took)]
