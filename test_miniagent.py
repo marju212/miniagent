@@ -1423,6 +1423,63 @@ class Bar(unittest.TestCase):
             self.bar.remove()
         self.assertFalse(self.bar.stale)
 
+    def _resize_to(self, rows):
+        """Pretend the window changed size: shutil reads LINES/COLUMNS first."""
+        os.environ["LINES"] = str(rows)
+        os.environ["COLUMNS"] = "80"
+        self.addCleanup(lambda: (os.environ.pop("LINES", None),
+                                 os.environ.pop("COLUMNS", None)))
+
+    def test_a_window_that_shrank_does_not_strand_the_prompt_below_the_region(self):
+        # A shorter window leaves the cursor clamped to the new last row, which
+        # is the bar's - outside the region. Restoring it there means the line
+        # cannot scroll: replies overwrite the prompt and the next draw wipes
+        # them, so the session looks dead at the bottom of the window while it
+        # is in fact fine.
+        agent.ui._TTY = True
+        self._resize_to(40)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.bar.install()
+            self.assertEqual(self.bar.row, 40)
+            self._resize_to(12)
+            self.bar._resized()
+            start = len(out.getvalue())
+            self.bar.draw("~/code  main")
+            after = out.getvalue()[start:]
+            self.bar.remove()
+        self.assertIn("\033[1;11r", after)          # the region was re-cut
+        self.assertIn("\033[11;1H", after)          # and the cursor put inside it
+        self.assertLess(after.index("\033[1;11r"), after.index("\0337"),
+                        "the stale cursor was restored before it was moved")
+
+    def test_a_window_that_grew_keeps_the_cursor_and_wipes_the_stale_bar(self):
+        agent.ui._TTY = True
+        self._resize_to(20)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.bar.install()
+            self._resize_to(40)
+            self.bar._resized()
+            start = len(out.getvalue())
+            self.bar.draw("~/code  main")
+            after = out.getvalue()[start:]
+            self.bar.remove()
+        self.assertIn("\033[1;39r", after)          # re-cut for the taller window
+        self.assertIn("\033[20;1H\033[2K", after)   # the row the old bar was on
+        # the cursor is still valid up there, so it is saved and put back
+        self.assertTrue(after.startswith("\0337"), repr(after[:12]))
+        self.assertEqual(after.count("\0337"), after.count("\0338"))
+
+    def test_the_bar_is_only_handed_to_atexit_once(self):
+        # `!` removes and re-installs the bar every time it is used
+        agent.ui._TTY = True
+        registered = []
+        with _patch(agent.ui.atexit, "register", registered.append):
+            with contextlib.redirect_stdout(io.StringIO()):
+                for _ in range(4):
+                    self.bar.install()
+                    self.bar.remove()
+        self.assertEqual(len(registered), 1)
+
     def test_a_terminal_too_narrow_to_truncate_into_is_still_respected(self):
         agent.ui._TTY = True
         saved = os.environ.get("COLUMNS")
@@ -1655,14 +1712,19 @@ class Leaving(unittest.TestCase):
         os.write(master, b"/quit\r")
         proc.wait(timeout=15)
 
-    def test_sigterm_gives_the_scrolling_region_back(self):
-        proc, master = self.start()
-        self.assertTrue(self.read_until(master, r"agent> "), self.buf)
-        self.buf = ""
-        proc.send_signal(signal.SIGTERM)
-        self.assertTrue(self.read_until(master, r"\033\[r", seconds=10)
-                        or "\033[r" in self.buf, self.buf)
-        self.assertEqual(proc.wait(timeout=15), -signal.SIGTERM)
+    def test_a_signal_that_kills_us_gives_the_scrolling_region_back(self):
+        # atexit does not run for any of these, and a region left one row short
+        # follows the user into whatever shell comes next. SIGQUIT is in the
+        # list because ctrl-\ is a slip of the hand away from ctrl-c.
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            with self.subTest(signal=sig.name):
+                proc, master = self.start()
+                self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+                self.buf = ""
+                proc.send_signal(sig)
+                self.assertTrue(self.read_until(master, r"\033\[r", seconds=10)
+                                or "\033[r" in self.buf, self.buf)
+                self.assertEqual(proc.wait(timeout=15), -sig)
 
 
 # ---------------------------------------------------------------- wrapper

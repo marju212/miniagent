@@ -1194,8 +1194,9 @@ def init_policy() -> None:
 def _terminate(sig, _frame):
     """Give the terminal back, then die of the signal we were sent.
 
-    atexit does not run for SIGTERM or SIGHUP, so without this the scrolling
-    region stays one row short in whatever shell comes next.  Re-raising
+    atexit does not run for a signal that kills us, so without this the
+    scrolling region stays one row short in whatever shell comes next - the
+    next shell's prompt sits on a row that no longer scrolls.  Re-raising
     rather than exiting keeps the status the 128+n a caller expects.
     """
     BAR.remove()
@@ -1302,7 +1303,9 @@ def main() -> None:
         print(dim(f"\n{USAGE}"))
         return
 
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    # SIGQUIT is in here because ctrl-\ is something a user can hit by
+    # accident while reaching for ctrl-c, and it kills us without atexit.
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
         try:
             signal.signal(sig, _terminate)
         except (AttributeError, ValueError, OSError):

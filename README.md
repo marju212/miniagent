@@ -78,8 +78,11 @@ default 6; `0` goes back to naming the call and nothing else.
 A grey bar is pinned to the bottom row: where the agent is working, the branch,
 and a `*` if the tree is dirty — all of which can change under you when the
 agent runs `git checkout`. It stays put while tools run, since that is when you
-most want to see it. `AGENT_STATUS=off` turns it off, and it never appears when
-the output is not a terminal.
+most want to see it. Resizing the window re-cuts the room it reserves, and
+anything that kills the agent — including `ctrl-\` — hands the row back before
+it goes, so the shell you land in afterwards scrolls normally.
+`AGENT_STATUS=off` turns it off, and it never appears when the output is not a
+terminal.
 
 ### Running something yourself
 

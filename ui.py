@@ -100,6 +100,8 @@ class StatusBar:
         self.on = False
         self.stale = False
         self.text = ""
+        self.row = 0            # the screen row the bar was last drawn on
+        self.registered = False
 
     def install(self) -> bool:
         if not _TTY or os.environ.get("AGENT_STATUS") == "off":
@@ -114,7 +116,9 @@ class StatusBar:
         # DECSTBM homes the cursor, so save and restore it around the change.
         emit(f"\n\033[1A\0337\033[1;{rows - 1}r\0338")
         self.on = True
-        atexit.register(self.remove)
+        if not self.registered:     # `!` re-installs the bar on every use
+            self.registered = True
+            atexit.register(self.remove)
         try:
             signal.signal(signal.SIGWINCH, self._resized)
         except (AttributeError, ValueError, OSError):
@@ -141,7 +145,24 @@ class StatusBar:
             if size.lines < 3:
                 self.remove()
                 return
-            recut = f"\0337\033[1;{size.lines - 1}r\0338"
+            if 0 < self.row and size.lines < self.row:
+                # The window got shorter, so the terminal clamped the cursor to
+                # the new last row - which is the bar's own, outside the region
+                # about to be cut.  Restoring it there strands the prompt where
+                # a line cannot scroll: every reply after that overwrites the
+                # prompt instead of appearing above it, and the next draw wipes
+                # what is left, so the session looks dead while it is fine.
+                # So place the cursor rather than restore it.  draw() only ever
+                # runs just before the prompt, which is where it belongs.
+                recut = (f"\033[1;{size.lines - 1}r"
+                         f"\033[{size.lines - 1};1H\033[2K")
+            else:
+                # Taller, or only wider: the cursor is still somewhere valid,
+                # so put it back.  What the old row holds now is a stale copy
+                # of the bar, stranded mid-screen; clear it on the way past.
+                ghost = (f"\033[{self.row};1H\033[2K"
+                         if 0 < self.row < size.lines else "")
+                recut = f"\0337{ghost}\033[1;{size.lines - 1}r\0338"
         # not _short(): it collapses runs of spaces, and the gaps between the
         # fields are what makes the bar readable
         room = max(1, size.columns - 2)
@@ -150,6 +171,7 @@ class StatusBar:
             line = (line[:max(0, room - 3)] + "...")[:room]
         # One write: a second writer must never land between the save and the
         # restore.
+        self.row = size.lines
         emit(f"{recut}\0337\033[{size.lines};1H\033[2K"
              f"\033[90m {line}\033[0m\0338")
 
@@ -157,6 +179,7 @@ class StatusBar:
         if not self.on:
             return
         self.on = False
+        self.row = 0
         rows = shutil.get_terminal_size().lines
         emit(f"\0337\033[r\033[{rows};1H\033[2K\0338")
 
