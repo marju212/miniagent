@@ -14,18 +14,6 @@ git clone https://github.com/marju212/miniagent && cd miniagent
 ./agent --install
 ```
 
-```
-linked  ~/.local/bin/agent -> ~/code/miniagent/agent
-
-settings -> ~/.miniagent/env
-  press enter to keep what is shown
-  endpoint [https://api.minimax.io/v1]: ▏
-  model [MiniMax-M2.5]:
-  api key (hidden; enter to fill in later):
-wrote   ~/.miniagent/env
-ready   ~/.local/bin is on your PATH
-```
-
 `--install` links the wrapper into `~/.local/bin`, asks for the three settings
 it needs, and offers to put that directory on your `PATH` if it is not there
 already. The key is not echoed, and skipping it leaves the file ready to fill
