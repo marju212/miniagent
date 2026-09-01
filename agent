@@ -44,7 +44,11 @@ usage: agent [wrapper option] | [agent option] [directory]
 wrapper options
   --install [bindir]   symlink onto your PATH (default ~/.local/bin), then
                        ask for endpoint, model and key if they are not set yet
-  --init               ask for endpoint, model and key, and save them
+  --init               ask for endpoint, model and key, and save them; run it
+                       again to change one - the prompts start from what is
+                       already there, and the rest of the file is left alone
+  --uninstall [bindir] remove the symlink, then offer to remove ~/.miniagent
+                       - your key, your rules, your history - after listing it
   --env                print the path of the settings file
                        (edit it with: $EDITOR "$(agent --env)")
 
@@ -301,10 +305,104 @@ install_self() {
 }
 
 
+# ---- uninstall ------------------------------------------------------------
+# What a file in the config directory is worth, so the y/N below is not a
+# guess about a list of bare filenames.
+describe() {
+    case $1 in
+        env)          printf 'your API key, model and endpoint' ;;
+        policy.json)  printf 'your global rules' ;;
+        trusted.json) printf 'project rule files you have vouched for' ;;
+        miniagent.md) printf 'standing instructions for every project' ;;
+        history)      printf 'what you have typed at the prompt' ;;
+        *)            printf '' ;;
+    esac
+}
+
+
+# Only ever unlink something of ours: a symlink into the directory this script
+# lives in. Another `agent` on PATH is someone else's program.
+remove_link() {                         # remove_link PATH
+    local link=$1 target
+    [ -L "$link" ] || return 1
+    target=$(readlink "$link")
+    case $target in
+        /*) ;;
+        *)  target=$(cd -P "$(dirname "$link")" && pwd)/$target ;;
+    esac
+    case $target in
+        "$HERE"/*) rm -f "$link" ;;
+        *) return 1 ;;
+    esac
+}
+
+
+uninstall_self() {
+    local bindir=${1:-} dirs dir link seen="" found=0
+
+    # No bindir given: look where --install puts it, and anywhere else on PATH
+    # it may have been put, so a link installed elsewhere is not left behind.
+    if [ -n "$bindir" ]; then dirs=$bindir; else dirs="$HOME/.local/bin:$PATH"; fi
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        case ":$seen:" in *":$dir:"*) continue ;; esac
+        seen="$seen:$dir"
+        for link in "$dir/agent" "$dir/miniagent"; do   # miniagent: the old name
+            if remove_link "$link"; then
+                printf 'removed %s\n' "$link"
+                found=1
+            fi
+        done
+    done < <(printf '%s\n' "$dirs" | tr ':' '\n')
+    [ "$found" = 1 ] || printf 'no link to %s found on your PATH\n' "$HERE"
+
+    # The rc line is left alone: it is your file, it may have been edited, and
+    # a stale PATH entry costs nothing. Naming it is enough.
+    local rc
+    rc=$(shell_rc)
+    if [ -f "$rc" ] && grep -q '# added by agent --install' "$rc" 2>/dev/null; then
+        printf '\n%s still has the PATH line --install added; remove it by hand:\n' "$rc"
+        printf '    # added by agent --install\n'
+        grep -A1 '# added by agent --install' "$rc" | grep '^export PATH=' | head -1 \
+            | sed 's/^/    /'
+    fi
+
+    if [ ! -d "$CONFIG_DIR" ]; then
+        printf '\nnothing left to remove; %s is not there\n' "$CONFIG_DIR"
+        return
+    fi
+
+    printf '\n%s still holds:\n' "$CONFIG_DIR"
+    local name what
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        what=$(describe "$name")
+        if [ -n "$what" ]; then printf '  %-14s %s\n' "$name" "($what)"
+        else printf '  %s\n' "$name"; fi
+    done < <(ls -A "$CONFIG_DIR" 2>/dev/null)
+
+    if ! interactive; then
+        printf '\nkept it; remove it yourself with: rm -rf %s\n' "$CONFIG_DIR"
+        return
+    fi
+    local answer
+    read -r -p "remove it too? [y/N] " answer
+    case $answer in
+        y|Y|yes) rm -rf "$CONFIG_DIR"; printf 'removed %s\n' "$CONFIG_DIR" ;;
+        *)       printf 'kept    %s\n' "$CONFIG_DIR" ;;
+    esac
+}
+
+
 case ${1:-} in
     --install)  shift; install_self "${1:-}"; exit 0 ;;
-    --init)     [ -f "$ENV_FILE" ] && die "$ENV_FILE already exists; edit it instead"
-                setup_env; printf 'wrote %s\n' "$ENV_FILE"; exit 0 ;;
+    --uninstall) shift; uninstall_self "${1:-}"; exit 0 ;;
+    --init)     if [ -f "$ENV_FILE" ]; then
+                    setup_env; printf 'updated %s\n' "$ENV_FILE"
+                else
+                    setup_env; printf 'wrote   %s\n' "$ENV_FILE"
+                fi
+                exit 0 ;;
     --env)      printf '%s\n' "$ENV_FILE"; exit 0 ;;
     -h|--help)  usage; echo; exec "$PYTHON" "$HERE/agent.py" --help ;;
 esac

@@ -20,10 +20,21 @@ already. The key is not echoed, and skipping it leaves the file ready to fill
 in later. With no terminal — a script, a pipe — it writes the defaults instead
 of asking.
 
-Run it again whenever you like: it is safe on a settings file that already
-exists. The prompts are seeded from what the file says, only those three lines
-are rewritten, and everything else — your own exports, your comments, a key
-fetched by `$(pass show …)` — is left exactly as it was.
+`agent --init` asks the same three questions on their own, and is how you
+change one later — when a new model lands, say. It is safe on a settings file
+that already exists: the prompts are seeded from what the file says, enter
+keeps what is shown, only those three lines are rewritten, and everything else
+— your own exports, your comments, a key fetched by `$(pass show …)` — is left
+exactly as it was. `--install` is safe to re-run too, though it only asks when
+there is no key yet.
+
+`agent --uninstall` is the way back out: it takes the symlink off your PATH,
+then lists what `~/.miniagent` still holds — your key, your global rules, the
+projects you have vouched for, your prompt history — and asks once before
+removing that too. Enter keeps it, so a re-install finds everything where it
+was. It never touches an `agent` on your PATH that is not a link to this
+checkout, it leaves the `PATH` line in your rc file for you to remove, and off
+a terminal it takes the link only and tells you the `rm -rf` to finish with.
 
 `agent --init-policy` then writes a global rule file you can edit, if you
 want to start from something other than the built-in defaults. Nothing stops
@@ -131,7 +142,8 @@ AGENT_MODEL=MiniMax-M2.5-highspeed agent ~/code/proj
 | | |
 |---|---|
 | `agent --install [bindir]` | symlink onto PATH, seed the settings file |
-| `agent --init` | ask for endpoint, model and key, and save them |
+| `agent --init` | ask for endpoint, model and key, and save them; run it again to change one |
+| `agent --uninstall [bindir]` | remove the symlink, then offer to remove `~/.miniagent` |
 | `agent --env` | print its path |
 | `MINIAGENT_ENV` | use a different settings file |
 | `MINIAGENT_PYTHON` | use a different interpreter |

@@ -2029,6 +2029,24 @@ class InteractiveSetup(unittest.TestCase):
                            env={"AGENT_API_KEY": "$(pass show minimax/api)"})
         self.assertIn("$(pass show minimax/api)", out)
 
+    # -- uninstall ---------------------------------------------------------
+    def test_uninstall_lists_what_it_would_remove_and_takes_yes_for_an_answer(self):
+        self.run_tty(["--install", str(self.bindir)], self.ALL_DEFAULTS)
+        out = self.run_tty(["--uninstall", str(self.bindir)],
+                           [(r"remove it too", b"y\r")])
+        self.assertIn("env", out)
+        self.assertIn("your API key", out)          # named, not just listed
+        self.assertFalse((self.bindir / "agent").exists())
+        self.assertFalse((self.home / ".miniagent").exists())
+
+    def test_enter_at_the_uninstall_prompt_keeps_your_settings(self):
+        self.run_tty(["--install", str(self.bindir)], self.ALL_DEFAULTS)
+        out = self.run_tty(["--uninstall", str(self.bindir)],
+                           [(r"remove it too", b"\r")])
+        self.assertIn("kept", out)
+        self.assertFalse((self.bindir / "agent").exists())   # the link still goes
+        self.assertTrue(self.env_file.exists())
+
     def test_a_world_readable_file_is_tightened_when_rewritten(self):
         # umask only governs creation, so writing into the existing file would
         # have left the key readable until the chmod after it
@@ -2055,13 +2073,43 @@ class Wrapper(unittest.TestCase):
         r = run_wrapper("--env", home=self.home)
         self.assertEqual(r.stdout.strip(), str(self.env_file))
 
-    def test_init_writes_a_private_file_and_will_not_clobber_it(self):
+    def test_init_writes_a_private_file_and_can_be_run_again(self):
+        # a second --init is how you change the model when a new one lands, so
+        # it re-asks rather than refusing - and off a terminal, where there is
+        # nothing to ask, it keeps every answer it already had
         r = run_wrapper("--init", home=self.home)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
+        self.write_env(self.env_file.read_text(encoding="utf-8")
+                       + "\nexport AGENT_API_KEY='sk-mine'\nexport MY_OWN=1\n")
+
         again = run_wrapper("--init", home=self.home)
-        self.assertNotEqual(again.returncode, 0)
-        self.assertIn("already exists", again.stderr)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("updated", again.stdout)
+        text = self.env_file.read_text(encoding="utf-8")
+        self.assertIn("sk-mine", text)          # the key survived
+        self.assertIn("MY_OWN=1", text)         # and so did the rest of the file
+        self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
+
+    def test_uninstall_takes_the_link_and_keeps_your_settings_off_a_terminal(self):
+        # nothing can be asked down a pipe, and the key is not ours to guess at
+        bindir = self.home / "bin"
+        run_wrapper("--install", str(bindir), home=self.home)
+        r = run_wrapper("--uninstall", str(bindir), home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((bindir / "agent").exists())
+        self.assertTrue(self.env_file.exists())
+        self.assertIn("rm -rf", r.stdout)           # says how to finish the job
+
+    def test_uninstall_will_not_remove_someone_elses_agent(self):
+        bindir = self.home / "bin"
+        bindir.mkdir(parents=True)
+        theirs = bindir / "agent"
+        theirs.write_text("#!/bin/sh\necho not ours\n", encoding="utf-8")
+        r = run_wrapper("--uninstall", str(bindir), home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(theirs.is_file())
+        self.assertIn("no link", r.stdout)
 
     def test_install_leaves_an_absolute_symlink_that_still_finds_agent_py(self):
         bindir = self.home / "bin"
