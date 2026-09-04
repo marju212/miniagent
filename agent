@@ -147,15 +147,24 @@ ask_secret() {
 merge_env() {                           # merge_env URL_LINE MODEL_LINE KEY_LINE
     # through the environment, not `awk -v`: -v expands backslash escapes, so a
     # key holding \n or ending in \ would be silently rewritten
-    MA_URL=$1 MA_MODEL=$2 MA_KEY=$3 awk '
+    MA_URL=$1 MA_MODEL=$2 MA_KEY=$3 \
+    MA_KEEP_URL=$4 MA_KEEP_MODEL=$5 MA_KEEP_KEY=$6 awk '
         BEGIN { url = ENVIRON["MA_URL"]; model = ENVIRON["MA_MODEL"]
-                key = ENVIRON["MA_KEY"] }
+                key = ENVIRON["MA_KEY"]
+                keep_url = ENVIRON["MA_KEEP_URL"]
+                keep_model = ENVIRON["MA_KEEP_MODEL"]
+                keep_key = ENVIRON["MA_KEEP_KEY"] }
         function put(text, seen) { if (!seen) print text }
-        /^[[:space:]]*(export[[:space:]]+)?AGENT_BASE_URL=/ { put(url, u); u = 1; next }
-        /^[[:space:]]*(export[[:space:]]+)?AGENT_MODEL=/    { put(model, m); m = 1; next }
-        /^[[:space:]]*(export[[:space:]]+)?AGENT_API_KEY=/  { put(key, k); k = 1; next }
+        # a kept setting keeps every line it has, so a file that assigns one
+        # twice still reads the way it did before
+        function replace(text, seen, keep) { if (keep) print $0; else put(text, seen) }
+        /^[[:space:]]*(export[[:space:]]+)?AGENT_BASE_URL=/ { replace(url, u, keep_url); u = 1; next }
+        /^[[:space:]]*(export[[:space:]]+)?AGENT_MODEL=/    { replace(model, m, keep_model); m = 1; next }
+        /^[[:space:]]*(export[[:space:]]+)?AGENT_API_KEY=/  { replace(key, k, keep_key); k = 1; next }
         { print }
-        END { put(url, u); put(model, m); put(key, k) }
+        END { if (!keep_url)   put(url, u)
+              if (!keep_model) put(model, m)
+              if (!keep_key)   put(key, k) }
     '
 }
 
@@ -192,18 +201,29 @@ EOF
 }
 
 
-write_env_file() {                      # write_env_file URL MODEL KEY
-    local dir tmp
+env_line() { printf 'export %s=%s' "$1" "$(shq "$2")"; }
+
+
+write_env_file() {                      # write_env_file URL MODEL KEY KEEP_URL KEEP_MODEL KEEP_KEY
+    local dir tmp made=0
     dir=$(dirname "$ENV_FILE")
+    [ -d "$dir" ] || made=1
     mkdir -p "$dir"
+    # Only mark a custom config directory when we created the directory. An
+    # arbitrary pre-existing MINIAGENT_HOME must never become an rm -rf target
+    # merely because an env file was written into it.
+    if [ "$made" = 1 ] && [ "$dir" = "$CONFIG_DIR" ]; then
+        : > "$dir/.miniagent-owned"
+    fi
     tmp=$(mktemp "$dir/env.XXXXXX") || die "cannot write in $dir"
     # 600 before the key goes in: `> "$ENV_FILE"` would have kept an existing
     # file's mode, leaving the key world-readable until the chmod afterwards
     chmod 600 "$tmp"
     if [ -f "$ENV_FILE" ]; then
-        merge_env "export AGENT_BASE_URL=$(shq "$1")" \
-                  "export AGENT_MODEL=$(shq "$2")" \
-                  "export AGENT_API_KEY=$(shq "$3")" < "$ENV_FILE" > "$tmp"
+        merge_env "$(env_line AGENT_BASE_URL "$1")" \
+                  "$(env_line AGENT_MODEL "$2")" \
+                  "$(env_line AGENT_API_KEY "$3")" \
+                  "$4" "$5" "$6" < "$ENV_FILE" > "$tmp"
     else
         fresh_env "export AGENT_BASE_URL=$(shq "$1")" \
                   "export AGENT_MODEL=$(shq "$2")" \
@@ -215,10 +235,15 @@ write_env_file() {                      # write_env_file URL MODEL KEY
 
 setup_env() {
     local url model key had shown
+    local was_url="" was_model="" was_key=""   # what the file itself said, if it did
+    local keep_url=0 keep_model=0 keep_key=0
 
-    url=$(from_file AGENT_BASE_URL)  || url=${AGENT_BASE_URL:-https://api.minimax.io/v1}
-    model=$(from_file AGENT_MODEL)   || model=${AGENT_MODEL:-MiniMax-M2.5}
-    had=$(from_file AGENT_API_KEY)   || had=${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}
+    if url=$(from_file AGENT_BASE_URL); then was_url=$url
+    else url=${AGENT_BASE_URL:-https://api.minimax.io/v1}; fi
+    if model=$(from_file AGENT_MODEL); then was_model=$model
+    else model=${AGENT_MODEL:-MiniMax-M2.5}; fi
+    if had=$(from_file AGENT_API_KEY); then was_key=$had
+    else had=${AGENT_API_KEY:-${MINIMAX_API_KEY:-}}; fi
 
     if interactive; then
         printf '\nsettings -> %s\n' "$ENV_FILE" >&2
@@ -236,7 +261,13 @@ setup_env() {
         key=$had
     fi
 
-    write_env_file "$url" "$model" "$key"
+    # An answer that is the file's own line back again leaves it untouched;
+    # only what actually changed is rewritten.
+    if [ -n "$was_url" ]   && [ "$url" = "$was_url" ];     then keep_url=1; fi
+    if [ -n "$was_model" ] && [ "$model" = "$was_model" ]; then keep_model=1; fi
+    if [ -n "$was_key" ]   && [ "$key" = "$was_key" ];     then keep_key=1; fi
+
+    write_env_file "$url" "$model" "$key" "$keep_url" "$keep_model" "$keep_key"
     [ -n "$key" ] || printf '\nno key yet. Put one in with: %s\n' \
                             "\$EDITOR \"\$(agent --env)\"" >&2
 }
@@ -377,14 +408,36 @@ uninstall_self() {
         return
     fi
 
+    # MINIAGENT_HOME is whatever you set it to, and one `rm -rf` below acts on
+    # it. A home directory or / is a mistake, never an install of ours.
+    local dir default_dir
+    dir=$(cd -P "$CONFIG_DIR" 2>/dev/null && pwd) || dir=""
+    default_dir=$(cd -P "$HOME" 2>/dev/null && pwd)/.miniagent
+    # The conventional directory is unambiguous. A custom directory needs a
+    # marker created when miniagent first made it, rather than merely trusting
+    # an arbitrary path supplied through MINIAGENT_HOME.
+    if [ -z "$dir" ] || { [ "$dir" != "$default_dir" ] && \
+                           [ ! -f "$dir/.miniagent-owned" ]; }; then
+        printf '\n%s is not a config directory of ours; leaving it alone\n' "$CONFIG_DIR"
+        return
+    fi
+
     printf '\n%s still holds:\n' "$CONFIG_DIR"
     local name what
     while IFS= read -r name; do
         [ -n "$name" ] || continue
+        [ "$name" = ".miniagent-owned" ] && continue
         what=$(describe "$name")
         if [ -n "$what" ]; then printf '  %-14s %s\n' "$name" "($what)"
         else printf '  %s\n' "$name"; fi
     done < <(ls -A "$CONFIG_DIR" 2>/dev/null)
+
+    # MINIAGENT_ENV can put the settings outside all this, and then the y
+    # below does not reach them - so say so rather than imply otherwise.
+    case $ENV_FILE in
+        "$dir"/*) ;;
+        *) printf '\nyour settings are elsewhere and stay there: %s\n' "$ENV_FILE" ;;
+    esac
 
     if ! interactive; then
         printf '\nkept it; remove it yourself with: rm -rf %s\n' "$CONFIG_DIR"

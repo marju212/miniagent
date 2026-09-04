@@ -98,6 +98,13 @@ agent> undo the change to the token check
 
 `!` on its own opens a shell; leave it and you are back at the prompt.
 
+`!cmd` runs in your interactive bash, zsh, or ksh, so your rc file is read and
+your aliases and functions are there — `!ll` means what `ll` means in your
+terminal. Other shell families fall back to bash for this one-line form.
+The agent's own `bash` tool deliberately does not do this: the policy judges the
+text of a command, and an alias is a way for the text and what actually runs to
+be two different things.
+
 The prompt has full line editing: **up arrow** walks back through what you have
 asked before, **ctrl-r** searches it, and the history carries over between
 sessions in `~/.miniagent/history` (`0600`, since it holds whatever you asked

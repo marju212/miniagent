@@ -1335,6 +1335,45 @@ class ShellEscape(unittest.TestCase):
         self.assertIn("a.txt", got)
         self.assertIn("a.txt", self.echoed)
 
+    def with_rc(self, text: str) -> None:
+        """An rc file of your own - where your aliases actually live."""
+        home = Path(tempfile.mkdtemp())
+        (home / ".bashrc").write_text(text, encoding="utf-8")
+        self.addCleanup(os.environ.__setitem__, "HOME", os.environ["HOME"])
+        os.environ["HOME"] = str(home)
+        os.environ["SHELL"] = "/bin/bash"
+
+    def test_your_aliases_are_in_effect(self):
+        # `!` is you, not the model, so `ll` should mean what it means in your
+        # terminal. That needs an *interactive* shell: bash does not expand
+        # aliases otherwise, and -l reads the profile rather than the rc file.
+        self.with_rc("alias ll='echo ALIAS-RAN'\n")
+        self.assertIn("ALIAS-RAN", self.run_it("!ll"))
+
+    def test_a_posix_sh_falls_back_to_bash_without_tty_noise(self):
+        old = os.environ.get("SHELL")
+        self.addCleanup(lambda: os.environ.__setitem__("SHELL", old)
+                        if old is not None else os.environ.pop("SHELL", None))
+        os.environ["SHELL"] = "/bin/dash"
+        self.assertEqual(agent.user_argv("echo hi")[0], "/bin/bash")
+        got = self.run_it("!echo hi")
+        self.assertNotIn("can't access tty", got)
+
+    def test_the_shells_startup_grumbling_is_not_shown_or_kept(self):
+        # an interactive shell with no terminal on stdin cannot take over job
+        # control and says so, twice, before running anything
+        self.with_rc("")
+        got = self.run_it("!echo hi")
+        for text in (got, self.echoed):
+            self.assertNotIn("job control", text)
+            self.assertNotIn("terminal process group", text)
+        self.assertEqual(got, "$ echo hi\nhi")
+
+    def test_output_of_your_own_is_never_mistaken_for_it(self):
+        self.with_rc("")
+        got = self.run_it('!echo "no job control in this shell"')
+        self.assertIn("no job control in this shell", got)
+
     def test_a_failing_command_carries_its_exit_code(self):
         self.assertIn("(exit 3)", self.run_it("!exit 3"))
 
@@ -2098,6 +2137,48 @@ class InteractiveSetup(unittest.TestCase):
                            env={"AGENT_API_KEY": "$(pass show minimax/api)"})
         self.assertIn("$(pass show minimax/api)", out)
 
+    # -- a second run ------------------------------------------------------
+    PASS_KEY = ("# mine\n"
+                "export AGENT_BASE_URL='https://api.minimax.io/v1'\n"
+                "export AGENT_MODEL='MiniMax-M2.5'\n"
+                "export AGENT_API_KEY=$(cat KEYFILE)   # from a password manager\n"
+                "export MY_OWN=1\n")
+
+    def with_pass_key(self) -> str:
+        """A key the file *fetches* rather than holds - what the README tells
+        you to do, and the one thing a rewrite must not turn into a string."""
+        keyfile = self.home / "key.txt"
+        keyfile.parent.mkdir(parents=True, exist_ok=True)
+        keyfile.write_text("sk-from-the-store\n", encoding="utf-8")
+        self.write_env(self.PASS_KEY.replace("KEYFILE", str(keyfile)))
+        return self.env_file.read_text(encoding="utf-8")
+
+    def test_changing_the_model_leaves_a_fetched_key_fetching(self):
+        before = self.with_pass_key()
+        self.run_tty(["--init"],
+                     [(r"endpoint \[", b"\r"), (r"model \[", b"MiniMax-M3\r"),
+                      (r"api key", b"\r")])
+        after = self.env_file.read_text(encoding="utf-8")
+        self.assertIn("MiniMax-M3", after)                  # the answer landed
+        self.assertIn("$(cat", after)                       # still a command
+        self.assertEqual(self.exports()["AGENT_API_KEY"], "sk-from-the-store")
+        self.assertEqual(after.replace("MiniMax-M3", "MiniMax-M2.5"), before,
+                         "it rewrote more than the line that changed")
+
+    def test_answering_with_what_is_already_there_writes_nothing_new(self):
+        before = self.with_pass_key()
+        self.run_tty(["--init"], self.ALL_DEFAULTS)
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), before)
+
+    def test_the_old_internal_marker_is_a_valid_value(self):
+        value = "__miniagent_keep_this_line__"
+        self.write_env(self.MINE)
+        self.run_tty(["--init"],
+                     [(r"endpoint \[", b"\r"),
+                      (r"model \[", value.encode() + b"\r"),
+                      (r"api key", b"sk-new\r")])
+        self.assertEqual(self.exports()["AGENT_MODEL"], value)
+
     # -- uninstall ---------------------------------------------------------
     def test_uninstall_lists_what_it_would_remove_and_takes_yes_for_an_answer(self):
         self.run_tty(["--install", str(self.bindir)], self.ALL_DEFAULTS)
@@ -2179,6 +2260,45 @@ class Wrapper(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(theirs.is_file())
         self.assertIn("no link", r.stdout)
+
+    def test_uninstall_will_not_rm_rf_a_home_directory(self):
+        # MINIAGENT_HOME is whatever you set it to, and one rm -rf acts on it
+        r = run_wrapper("--uninstall", home=self.home,
+                        env={"MINIAGENT_HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("not a config directory", r.stdout)
+        self.assertNotIn("rm -rf", r.stdout)
+        self.assertTrue(self.home.is_dir())
+
+    def test_uninstall_will_not_rm_rf_an_arbitrary_custom_directory(self):
+        important = Path(tempfile.mkdtemp()).resolve()
+        (important / "keep-me").write_text("important\n", encoding="utf-8")
+        r = run_wrapper("--uninstall", home=self.home,
+                        env={"MINIAGENT_HOME": str(important)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("not a config directory", r.stdout)
+        self.assertNotIn("rm -rf", r.stdout)
+        self.assertTrue((important / "keep-me").is_file())
+
+    def test_a_custom_directory_created_by_miniagent_is_marked_as_its_own(self):
+        custom = self.home / "custom-config"
+        r = run_wrapper("--init", home=self.home,
+                        env={"MINIAGENT_HOME": str(custom)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((custom / ".miniagent-owned").is_file())
+        uninstall = run_wrapper("--uninstall", home=self.home,
+                                env={"MINIAGENT_HOME": str(custom)})
+        self.assertIn("remove it yourself", uninstall.stdout)
+        self.assertNotIn("not a config directory", uninstall.stdout)
+
+    def test_uninstall_says_when_your_settings_live_somewhere_else(self):
+        elsewhere = self.home / "elsewhere-env"
+        elsewhere.write_text("export AGENT_MODEL=x\n", encoding="utf-8")
+        r = run_wrapper("--uninstall", home=self.home,
+                        env={"MINIAGENT_ENV": str(elsewhere)})
+        self.assertIn("stay there", r.stdout)
+        self.assertIn(str(elsewhere), r.stdout)
+        self.assertTrue(elsewhere.is_file())
 
     def test_install_leaves_an_absolute_symlink_that_still_finds_agent_py(self):
         bindir = self.home / "bin"

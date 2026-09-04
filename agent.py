@@ -219,6 +219,33 @@ def bash_argv(cmd: str) -> list:
     return ["bash", "-lc", 'cd -- "$MINIAGENT_CWD" || exit 1\n' + cmd]
 
 
+def user_argv(cmd: str) -> list:
+    """`!cmd` runs in *your* shell, interactively, so your rc file and the
+    aliases in it are in effect: `ll` at the prompt means what it means in
+    your terminal.  The agent's own bash tool deliberately does not do this -
+    the policy judges the text of a command, and an alias is a way for the
+    text and what actually runs to be two different things.
+    """
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    if os.path.basename(shell) not in ("bash", "zsh", "ksh", "mksh"):
+        # POSIX sh/dash do not have a predictable interactive rc file (dash
+        # uses ENV) and also print unavoidable tty warnings with our closed
+        # stdin. Fish and csh cannot parse the POSIX preamble below.
+        shell = "/bin/bash"
+    return [shell, "-ic", 'cd -- "$MINIAGENT_CWD" || exit 1\n' + cmd]
+
+
+# An interactive shell with no terminal on its stdin says so before it runs
+# anything: it cannot take over job control.  That is the shell starting up,
+# rather than your command talking, so the lines are dropped.  Both halves of
+# the pattern matter: they are only dropped while they *lead* the output, and
+# only when the shell named itself first, so `!echo "no job control in this
+# shell"` still prints what you asked for.
+JOB_CONTROL = re.compile(r"^\S+: (cannot set terminal process group"
+                         r"|can.t set tty pgrp"
+                         r"|no job control in this shell)")
+
+
 def bash_env() -> dict:
     return {**os.environ, "MINIAGENT_CWD": str(ROOTS[0])}
 
@@ -398,7 +425,7 @@ def shell_escape(line: str) -> str:
             BAR.install()
         return ""
     try:
-        p = subprocess.Popen(bash_argv(cmd), cwd=ROOTS[0], env=bash_env(),
+        p = subprocess.Popen(user_argv(cmd), cwd=ROOTS[0], env=bash_env(),
                              text=True, errors="replace",
                              stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -406,9 +433,14 @@ def shell_escape(line: str) -> str:
         warn(str(e))
         return ""
     out = []
+    starting = True                 # still in the shell's own startup noise
     try:
         try:
             for chunk in p.stdout:  # echoed as it arrives, and kept
+                if starting:
+                    if JOB_CONTROL.search(chunk):
+                        continue
+                    starting = False
                 sys.stdout.write(chunk)
                 out.append(chunk)
             code = p.wait()
