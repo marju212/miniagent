@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import signal
+import ssl
 import subprocess
 import sys
 import time
@@ -87,6 +88,12 @@ TOP_K = _env("AGENT_TOP_K", 40, int)
 MAX_TOKENS = _env("AGENT_MAX_TOKENS", 16384, int)
 REASONING = _env("AGENT_REASONING", "")      # only for servers that take it
 TIMEOUT = _env("AGENT_TIMEOUT", 900, int)
+# Where to look for the CA certificates that vouch for the endpoint.  Read
+# straight from the environment rather than through _env, so setting it to
+# nothing means "the system trust store only" instead of the default below.
+CA_CERTS = [p for p in os.environ.get(
+    "AGENT_CA_CERTS",
+    "/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt").split(os.pathsep) if p]
 RETRIES = _env("AGENT_RETRIES", 5, int)
 CONTEXT_CHARS = _env("AGENT_CONTEXT_CHARS", 480_000, int)  # ~200k tokens
 SHOW_THINKING = os.environ.get("AGENT_THINKING") == "1"
@@ -831,6 +838,34 @@ def _shape(body: dict) -> dict:
     return msg
 
 
+_SSL_CTX = None
+
+
+def ssl_context():
+    """The trust store to verify the endpoint against, built once.
+
+    Every entry of AGENT_CA_CERTS that exists is loaded *on top of* what
+    OpenSSL already trusts, so a corporate or self-signed CA can sit beside
+    the system bundle rather than replacing it.  A missing entry is not an
+    error: the defaults name two files that only some distributions ship.
+    """
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        ctx = ssl.create_default_context()
+        for path in CA_CERTS:
+            if not os.path.exists(path):
+                continue
+            try:
+                if os.path.isdir(path):
+                    ctx.load_verify_locations(capath=path)
+                else:
+                    ctx.load_verify_locations(cafile=path)
+            except (OSError, ssl.SSLError) as e:
+                warn(f"ignoring the CA bundle {path}: {e}")
+        _SSL_CTX = ctx
+    return _SSL_CTX
+
+
 def llm(messages: list, tools: list) -> dict:
     last = "no attempt was made"
     tries = max(1, RETRIES)
@@ -843,7 +878,8 @@ def llm(messages: list, tools: list) -> dict:
                      "Authorization": f"Bearer {API_KEY}"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            with urllib.request.urlopen(
+                    req, timeout=TIMEOUT, context=ssl_context()) as r:
                 body = json.loads(r.read())
         except urllib.error.HTTPError as e:
             text = e.read().decode("utf-8", "replace")[:800]
@@ -874,6 +910,16 @@ def llm(messages: list, tools: list) -> dict:
         # IncompleteRead, which would otherwise escape every handler here.
         except (urllib.error.URLError, TimeoutError, OSError,
                 http.client.HTTPException) as e:
+            why = getattr(e, "reason", e)
+            if isinstance(why, ssl.SSLCertVerificationError):
+                # Nothing about this gets better on the fifth try: the
+                # certificate will not verify until the trust store changes.
+                tried = ", ".join(CA_CERTS) or "nothing"
+                said = getattr(why, "verify_message", None) or why
+                raise ApiError(
+                    f"cannot verify the certificate of {BASE_URL}: {said} - "
+                    f"point AGENT_CA_CERTS at the CA bundle that signs it "
+                    f"(tried: {tried})")
             last = f"cannot reach {BASE_URL}: {e}"
             attempt += 1
             if attempt < tries:

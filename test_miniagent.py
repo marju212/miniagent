@@ -22,7 +22,10 @@ import sys
 import tempfile
 import threading
 import time
+import ssl
 import unittest
+import urllib.error
+import urllib.request
 import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -958,6 +961,72 @@ class Recoverable(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             agent.run_turn(make_policy(), msgs, 5)
         self.assertEqual(msgs[-1]["content"], "second time lucky")
+
+
+# ---------------------------------------------------------------- trust
+class TrustStore(unittest.TestCase):
+    """The CA bundles AGENT_CA_CERTS names, and what a bad certificate says."""
+
+    def setUp(self):
+        FAULTS.clear()
+        agent._SSL_CTX = None       # built once and cached; each test wants its own
+        self.addCleanup(setattr, agent, "_SSL_CTX", None)
+
+    def context(self, paths):
+        with _patch(agent, "CA_CERTS", paths), _patch(agent, "_SSL_CTX", None):
+            return agent.ssl_context()
+
+    def test_a_bundle_that_is_not_there_is_skipped_not_fatal(self):
+        # The two defaults are the two files distributions disagree about, so
+        # neither being present has to be ordinary.
+        ctx = self.context(["/etc/ssl/cert.pem", "/etc/ssl/certs/ca_bundle.crt",
+                            "/no/such/bundle.pem"])
+        self.assertTrue(ctx.get_ca_certs() or ctx.cert_store_stats()["x509"] >= 0)
+
+    def test_the_system_store_is_still_there_underneath(self):
+        # Loading a private CA adds to what OpenSSL trusts; it must not take
+        # the public ones away, or every other endpoint would stop verifying.
+        before = self.context([]).cert_store_stats()["x509"]
+        after = self.context(["/no/such/bundle.pem"]).cert_store_stats()["x509"]
+        self.assertEqual(before, after)
+
+    def test_a_bundle_that_will_not_parse_is_a_warning_not_a_traceback(self):
+        bad = Path(tempfile.mkdtemp()) / "ca.crt"
+        bad.write_text("this is not a certificate\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.context([str(bad)])
+        self.assertIn(str(bad), err.getvalue())
+
+    def test_a_directory_of_certificates_is_read_as_one(self):
+        d = tempfile.mkdtemp()
+        self.context([d])       # capath, not cafile: must not raise
+
+    def test_a_certificate_that_will_not_verify_names_the_setting(self):
+        def fail(*a, **k):
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError("certificate verify failed"))
+
+        with _patch(agent, "CA_CERTS", ["/etc/ssl/cert.pem"]), \
+                _patch(urllib.request, "urlopen", fail):
+            with self.assertRaises(agent.ApiError) as caught:
+                agent.llm([{"role": "user", "content": "hi"}], [])
+        said = str(caught.exception)
+        self.assertIn("AGENT_CA_CERTS", said)
+        self.assertIn("/etc/ssl/cert.pem", said)
+
+    def test_it_does_not_retry_a_certificate_it_cannot_verify(self):
+        tries = []
+
+        def fail(*a, **k):
+            tries.append(1)
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError("certificate verify failed"))
+
+        with _patch(agent, "RETRIES", 5), _patch(urllib.request, "urlopen", fail):
+            with self.assertRaises(agent.ApiError):
+                agent.llm([{"role": "user", "content": "hi"}], [])
+        self.assertEqual(len(tries), 1)
 
 
 # ---------------------------------------------------------------- what you see

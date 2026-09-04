@@ -336,6 +336,19 @@ MiniMax reports auth and quota failures inside an HTTP 200, so those are read
 out of the body and named the same way. Rate limits and internal errors are
 retried with backoff first, and only reported if they do not clear.
 
+`certificate verify failed` is not retried — it will not clear on its own. It
+means nothing in the trust store signs the endpoint's certificate, which is
+what a corporate proxy or a private endpoint looks like. `AGENT_CA_CERTS` is
+the list of bundles to load on top of the system store, `:`-separated, and
+defaults to the two files distributions most often put one in:
+
+```bash
+export AGENT_CA_CERTS=/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt
+```
+
+An entry that does not exist is skipped, a directory is read as one, and
+setting it empty falls back to the system store alone.
+
 ## Tuned for MiniMax-M2.5
 
 | what | why |
@@ -411,6 +424,7 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_CONTEXT_CHARS` | `480000` |
 | `AGENT_MAX_STEPS` | policy `max_steps`; may only lower it |
 | `AGENT_POLICY` | an extra rule file for one run |
+| `AGENT_CA_CERTS` | `/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt` |
 | `AGENT_THINKING` / `AGENT_YOLO` | off |
 | `AGENT_PROMPT` | `agent> ` |
 | `AGENT_STATUS` | on; `off` hides the bottom bar |

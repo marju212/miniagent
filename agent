@@ -180,6 +180,11 @@ EOF
 # export AGENT_TOP_K=40
 # export AGENT_MAX_TOKENS=16384
 
+# The CA bundles that verify the endpoint's certificate, tried in order and
+# loaded on top of the system trust store.  Set it if you get
+# "certificate verify failed"; set it empty to use the system store alone.
+# export AGENT_CA_CERTS=/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt
+
 # export AGENT_THINKING=1     # show the model's reasoning
 # export AGENT_YOLO=1         # auto-approve every `ask` (a `deny` still holds)
 # export AGENT_POLICY=        # an extra rule file for every run
