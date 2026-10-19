@@ -348,12 +348,14 @@ class LiveReply:
     """Prints a reply while it streams in, the way `render` prints a whole one.
 
     The text is shown as it arrives; the reasoning only when asked for, dim
-    and indented.  An inline `<think>` block and raw `<minimax:tool_call>`
-    markup are kept off the screen, a tag split across two chunks included.
+    and indented.  An inline `<think>` block and raw tool-call markup
+    (`<minimax:tool_call>`, Qwen's `<tool_call>`) are kept off the screen, a tag split across two chunks included.
     Only the screen is filtered: the transcript keeps every byte.
     """
 
-    TAGS = ("<think>", "</think>", "<minimax:tool_call>", "</minimax:tool_call>")
+    TAGS = ("<think>", "</think>", "<minimax:tool_call>", "</minimax:tool_call>",
+            "<tool_call>", "</tool_call>")
+    OPENS = {"<think>": "think", "<minimax:tool_call>": "call", "<tool_call>": "call"}
 
     def __init__(self, show_thinking: bool):
         self.show = show_thinking
@@ -432,7 +434,7 @@ class LiveReply:
             self.buf = self.buf[i:]
             tag = next((t for t in self.TAGS if self.buf.startswith(t)), None)
             if tag:
-                self.mode = {"<think>": "think", "<minimax:tool_call>": "call"}.get(tag, "text")
+                self.mode = self.OPENS.get(tag, "text")
                 self.buf = self.buf[len(tag):]
             elif any(t.startswith(self.buf) for t in self.TAGS):
                 return              # wait for the rest of what may be a tag

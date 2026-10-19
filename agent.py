@@ -1080,9 +1080,14 @@ def call_tool(pol, name: str, args: dict) -> tuple:
 
 # ---------------------------------------------------------------- thinking
 _THINK = re.compile(r"<think>(.*?)</think>\s*", re.S)
-_TC_BLOCK = re.compile(r"<minimax:tool_call>(.*?)(?:</minimax:tool_call>|\Z)", re.S)
+# MiniMax wraps its calls in <minimax:tool_call>, Qwen in a bare <tool_call>.
+_TC_BLOCK = re.compile(r"<(?:minimax:)?tool_call>(.*?)(?:</(?:minimax:)?tool_call>|\Z)", re.S)
+# MiniMax:  <invoke name="read_file"><parameter name="path">x</parameter></invoke>
 _TC_INVOKE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)(?:</invoke>|\Z)', re.S)
 _TC_PARAM = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)(?:</parameter>|\Z)', re.S)
+# Qwen3-Coder, Qwen3.8:  <function=read_file><parameter=path>x</parameter></function>
+_TC_FUNCTION = re.compile(r"<function=([^>\s]+)\s*>(.*?)(?:</function>|\Z)", re.S)
+_TC_QPARAM = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)(?:</parameter>|\Z)", re.S)
 
 
 def split_think(content) -> tuple[str, str]:
@@ -1131,22 +1136,48 @@ def _coerce(tool: str, key: str, raw: str):
     return raw
 
 
+def _rescued_json(body: str):
+    """(name, args) from Hermes-style `{"name": .., "arguments": {..}}`."""
+    start, end = body.find("{"), body.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        got = json.loads(body[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(got, dict) or not isinstance(got.get("name"), str):
+        return None
+    args = got.get("arguments", got.get("parameters", {}))
+    if isinstance(args, str):
+        args = parse_args_json(args)[0]
+    return (got["name"], args) if isinstance(args, dict) else None
+
+
 def rescue_tool_calls(content) -> list:
-    """Some servers hand MiniMax's raw <minimax:tool_call> markup back as plain
-    text instead of parsing it.  Recover the calls so the turn still works."""
-    if not isinstance(content, str) or "<minimax:tool_call>" not in content:
+    """Some servers hand the model's raw tool-call markup back as plain text
+    instead of parsing it - MiniMax's <minimax:tool_call>, or Qwen's
+    <tool_call> holding either <function=..> tags or JSON.  Recover the calls
+    so the turn still works."""
+    if not isinstance(content, str):
         return []
-    calls = []
-    for block in _TC_BLOCK.findall(content):
-        for name, body in _TC_INVOKE.findall(block):
-            args = {k: _coerce(name, k, v.strip("\n"))
-                    for k, v in _TC_PARAM.findall(body)}
-            calls.append({
-                "id": f"rescued_{len(calls) + 1}",
-                "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args)},
-            })
-    return calls
+    visible = split_think(content)[1]
+    blocks = _TC_BLOCK.findall(visible)
+    if not blocks and "<function=" in visible:
+        blocks = [visible]          # the opening <tool_call> went missing
+    found = []
+    for block in blocks:
+        tagged = _TC_INVOKE.findall(block) or _TC_FUNCTION.findall(block)
+        for name, body in tagged:
+            pairs = _TC_PARAM.findall(body) or _TC_QPARAM.findall(body)
+            found.append((name.strip(), {k: _coerce(name.strip(), k, v.strip("\n"))
+                                         for k, v in pairs}))
+        if not tagged:
+            got = _rescued_json(block)
+            if got:
+                found.append(got)
+    return [{"id": f"rescued_{n}", "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}
+            for n, (name, args) in enumerate(found, 1)]
 
 
 def parse_args_json(raw: str):

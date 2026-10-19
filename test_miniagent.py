@@ -477,6 +477,29 @@ class MiniMaxWireFormat(unittest.TestCase):
         self.assertEqual(first, {"path": "a.txt", "limit": 5})   # typed by schema
         self.assertEqual(json.loads(calls[1]["function"]["arguments"]), {"cmd": "ls -la"})
 
+    def test_raw_qwen_tool_call_markup_is_recovered(self):
+        calls = agent.rescue_tool_calls(
+            'Reading.\n<tool_call>\n<function=read_file>\n'
+            '<parameter=path>\nsrc/a.py\n</parameter>\n'
+            '<parameter=offset>\n10\n</parameter>\n'
+            '</function>\n</tool_call>\n'
+            '<tool_call>\n{"name": "glob", "arguments": {"pattern": "**/*.py"}}\n</tool_call>')
+        self.assertEqual([c["function"]["name"] for c in calls], ["read_file", "glob"])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"path": "src/a.py", "offset": 10})
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"]),
+                         {"pattern": "**/*.py"})
+
+    def test_qwen_markup_is_recovered_without_its_opening_tag(self):
+        calls = agent.rescue_tool_calls(
+            '<function=bash><parameter=cmd>ls</parameter></function></tool_call>')
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"cmd": "ls"})
+
+    def test_markup_inside_the_thinking_is_not_run(self):
+        self.assertEqual(agent.rescue_tool_calls(
+            '<think><tool_call><function=bash><parameter=cmd>rm -rf x'
+            '</parameter></function></tool_call></think>Not doing that.'), [])
+
     def test_wire_strips_our_own_bookkeeping(self):
         sent = agent.wire([{"role": "tool", "content": "x", "_compact": True,
                             "tool_call_id": "c1", "refusal": None}])[0]
@@ -2763,6 +2786,17 @@ class Streaming(unittest.TestCase):
                                    _delta(content=markup[20:])],
                                   [_delta(content="done")])
         self.assertNotIn("invoke", out)
+        self.assertIn("hi there", msgs[3]["content"])
+
+    def test_raw_qwen_markup_is_hidden_and_still_run(self):
+        markup = ('<tool_call>\n<function=read_file>\n'
+                  '<parameter=path>\nhello.txt\n</parameter>\n</function>\n'
+                  '</tool_call>')
+        with contextlib.redirect_stderr(io.StringIO()):
+            msgs, out = self.turn([_delta(content="Reading. " + markup[:4]),
+                                   _delta(content=markup[4:])],
+                                  [_delta(content="done")])
+        self.assertNotIn("function=", out)
         self.assertIn("hi there", msgs[3]["content"])
 
     def test_an_error_event_is_an_api_error(self):
