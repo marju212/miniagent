@@ -375,6 +375,46 @@ def t_grep(pattern: str, path: str = ".", include: str = "",
             f"{_n(files, 'file')}{stop}{why}\n" + "\n".join(hits))
 
 
+# ---------------------------------------------------------------- todo
+TODOS: list = []
+TODO_MARK = {"pending": "[ ]", "in_progress": "[~]", "done": "[x]"}
+TODO_SPELLINGS = {"completed": "done", "complete": "done", "finished": "done",
+                  "in progress": "in_progress", "active": "in_progress",
+                  "doing": "in_progress", "todo": "pending"}
+
+
+def show_todos() -> str:
+    if not TODOS:
+        return "the list is empty"
+    done = sum(1 for t in TODOS if t["status"] == "done")
+    return (f"{done}/{len(TODOS)} done\n"
+            + "\n".join(f"{TODO_MARK[t['status']]} {t['task']}" for t in TODOS))
+
+
+def t_todo(items) -> str:
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except json.JSONDecodeError:
+            items = [l for l in items.splitlines() if l.strip()]
+    if not isinstance(items, list):
+        return "ERROR: items must be a list of {task, status}"
+    clean = []
+    for it in items:
+        if isinstance(it, str):
+            it = {"task": it}
+        if not isinstance(it, dict):
+            continue
+        task = str(it.get("task") or it.get("content") or "").strip()
+        status = str(it.get("status") or "pending").strip().lower()
+        status = TODO_SPELLINGS.get(status, status)
+        if task:
+            clean.append({"task": task,
+                          "status": status if status in TODO_MARK else "pending"})
+    TODOS[:] = clean
+    return show_todos()
+
+
 def bash_argv(cmd: str) -> list:
     """A login shell, so whatever sets up the user's PATH - nvm, pyenv, a
     devcontainer profile - is in effect. Profile scripts are allowed to `cd`
@@ -482,6 +522,16 @@ TOOLS = {
         "path": {"type": "string", "description": "Directory to search. Default the working directory."},
         "limit": {"type": "integer", "description": "At most this many paths. Default 500."},
     }, ["pattern"]),
+    "todo": (t_todo, "Replace your task list for this session and show it. Use it for work with three or more steps: write the plan, mark one item in_progress at a time, mark it done as soon as it is.", {
+        "items": {"type": "array", "description": "The whole list, every time.", "items": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+            },
+            "required": ["task", "status"],
+        }},
+    }, ["items"]),
     "bash": (t_bash, "Run a shell command in the working directory: tests, builds, git. Use grep, glob and read_file to look around.", {
         "cmd": {"type": "string", "description": "The command line to run."},
         "timeout": {"type": "integer", "description": "Seconds to wait. Default 120."},
@@ -1395,7 +1445,8 @@ def system_prompt(root: Path, pol) -> str:
 Work in small steps: read before you write, make focused changes, then verify
 with a command. All paths are relative to the working directory. Prefer
 edit_file over rewriting a whole file. Find things with grep and glob rather
-than through bash. Run several independent tool calls in
+than through bash. For work of three or more steps, keep a todo list and mark
+items off as you go. Run several independent tool calls in
 one turn instead of one at a time. Keep your messages to the user short - do
 the actual work with tools, and stop when the task is done rather than
 narrating what you might do next.
@@ -1505,6 +1556,7 @@ HELP = """  /help            this text
   up arrow         an earlier prompt; ctrl-r searches them
   alt-enter        insert a newline; enter sends the whole message
   paste            several lines show as [Pasted text #1 +N lines]
+  /todo            the agent's task list
   /undo            put back the file the agent's last write changed
   /cost            tokens used this session
   /retry           send the conversation again after a failed request
@@ -1588,6 +1640,8 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list,
             freed = compact(messages, budget)
             print(f"  freed {freed:,} chars" if freed
                   else "  nothing left to shrink; /clear starts fresh")
+    elif word == "todo":
+        print("\n".join("  " + l for l in show_todos().splitlines()))
     elif word == "undo":
         said = undo_last()
         print(f"  {said}")
@@ -1598,6 +1652,7 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list,
         del messages[1:]
         messages[0] = {"role": "system", "content": system}
         mine.clear()          # including anything `!` produced but never sent
+        TODOS.clear()
         print("  conversation cleared")
     else:
         print(f"  unknown command {cmd!r}; try /help")

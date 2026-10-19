@@ -125,6 +125,7 @@ DEFAULTS = {
         # The search tools read each file through the read_file rules, so a
         # file read_file may not touch unasked is skipped rather than searched.
         "grep(**)", "glob(**)",
+        "todo",
         "bash(ls*)", "bash(cat *)", "bash(head *)", "bash(tail *)",
         "bash(wc *)", "bash(file *)", "bash(pwd*)", "bash(echo *)",
         "bash(grep *)", "bash(rg *)", "bash(find *)", "bash(which *)",

@@ -347,6 +347,9 @@ def diff_lines(before: str, after: str, max_lines: int = 24) -> list:
 def tool_line(name: str, args: dict, subject_key: str = "") -> str:
     """`bash(pytest -q)` - the same shape the permission prompt and /policy
     use, so the three agree on how a call is named."""
+    if name == "todo":
+        items = args.get("items")
+        return dim(f"  · todo({len(items) if isinstance(items, list) else '?'} items)")
     if name in ("grep", "glob"):
         # The pattern is what the call is about; the path is where.
         where = str(args.get("path") or "")
@@ -424,6 +427,10 @@ def tool_result(name: str, result: str, seconds: float = 0.0,
         # rather than how long the file is; say so instead of implying it.
         cut = " (clipped)" if _CUT_OUT in result else ""
         return ["    " + dim(_fit(f"{n} lines{cut}{more}{took}", room))]
+
+    if name == "todo":
+        # The list is the point of the call; it is short by construction.
+        return ["    " + dim(_fit(l, room)) for l in result.splitlines()]
 
     # write_file / edit_file already say +N -M themselves; grep and glob
     # lead with a count

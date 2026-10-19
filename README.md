@@ -406,6 +406,7 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 /retry           send the conversation again after a failed request
 /compact         shrink old tool output to make room
 /undo            put back the file the agent's last write changed
+/todo            the agent's task list
 
 !cmd             run a command yourself; ! alone opens a shell
 up arrow         an earlier prompt; ctrl-r searches them
@@ -420,7 +421,7 @@ agent --check bash 'git push'    # explain one decision
 
 ## Tools
 
-`read_file`, `write_file`, `edit_file`, `grep`, `glob`, `bash` — all
+`read_file`, `write_file`, `edit_file`, `grep`, `glob`, `todo`, `bash` — all
 confined to the working directory (plus anything in `allowed_roots`), all
 gated by the policy.
 
@@ -435,6 +436,9 @@ they open is put to the `read_file` rules: a file that `read_file` could not
 read without asking is skipped, and the result says how many were. So
 `grep(**)` cannot read the `.env` that `read_file(**/.env)` denies. `.git`,
 `node_modules`, virtualenvs and caches are not descended into.
+
+`todo` is the model's own task list for work of several steps. It is shown
+under the call each time it changes, and `/todo` shows it any time.
 
 `bash` runs a login shell, so whatever sets up your `PATH` — nvm, pyenv, a
 devcontainer profile — is in effect. Profile scripts are allowed to `cd` and

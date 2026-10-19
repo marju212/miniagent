@@ -2721,6 +2721,7 @@ class Search(unittest.TestCase):
         pol = make_policy()
         self.assertEqual(pol.check("grep", {"path": "."}).action, "allow")
         self.assertEqual(pol.check("glob", {"path": "src"}).action, "allow")
+        self.assertEqual(pol.check("todo", {}).action, "allow")
 
     def test_a_search_without_a_path_is_judged_as_the_working_directory(self):
         pol = make_policy(allow=["grep(.)"])
@@ -2770,6 +2771,22 @@ class Edits(unittest.TestCase):
             agent.slash(make_policy(), "/undo", [{"role": "system"}], "s", mine)
         self.assertEqual(len(mine), 1)
         self.assertIn("restored a.py", mine[0])
+
+
+# ---------------------------------------------------------------- todo
+class Todo(unittest.TestCase):
+    def test_the_list_is_replaced_and_shown(self):
+        out = agent.t_todo([{"task": "read", "status": "done"},
+                            {"task": "fix", "status": "in progress"},
+                            "test"])
+        self.assertEqual(out.splitlines(), ["1/3 done", "[x] read", "[~] fix", "[ ] test"])
+        agent.t_todo([])
+        self.assertEqual(agent.TODOS, [])
+
+    def test_shown_in_full_under_the_call(self):
+        out = agent.t_todo([{"task": "a", "status": "pending"}])
+        lines = ui.tool_result("todo", out, 0, 6)
+        self.assertTrue(any("[ ] a" in l for l in lines))
 
 
 
