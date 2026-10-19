@@ -182,12 +182,15 @@ EOF
 # A key out of a password manager works too:
 # export AGENT_API_KEY=$(pass show minimax/api)
 
-# The settings MiniMax measured M2.x at.  Leave them be unless you have a
-# reason - drifting off them is the usual cause of flaky tool calls.
+# Sampling follows AGENT_MODEL: MiniMax, Qwen3.8 and Qwen3-Coder each get the
+# settings their makers publish, and the banner says which it picked.  Set one
+# here only to override it - whatever is set wins over the profile.
 # export AGENT_TEMPERATURE=1.0
 # export AGENT_TOP_P=0.95
 # export AGENT_TOP_K=40
+# export AGENT_REPETITION_PENALTY=1.05
 # export AGENT_MAX_TOKENS=16384
+# export AGENT_CONTEXT_CHARS=480000
 
 # The CA bundles that verify the endpoint's certificate, tried in order and
 # loaded on top of the system trust store.  Set it if you get

@@ -84,12 +84,62 @@ BASE_URL = _env("AGENT_BASE_URL", "https://api.minimax.io/v1").rstrip("/")
 API_KEY = os.environ.get("AGENT_API_KEY") or os.environ.get("MINIMAX_API_KEY", "")
 MODEL = _env("AGENT_MODEL", "MiniMax-M2.5")
 
-# MiniMax publishes these as the settings M2.x was measured at; drifting off
-# them is the usual cause of flaky tool calls, so they are the defaults here.
-TEMPERATURE = _env("AGENT_TEMPERATURE", 1.0, float)
-TOP_P = _env("AGENT_TOP_P", 0.95, float)
-TOP_K = _env("AGENT_TOP_K", 40, int)
-MAX_TOKENS = _env("AGENT_MAX_TOKENS", 16384, int)
+# Sampling defaults per model family, picked by AGENT_MODEL.  Each is what
+# the model's makers publish and measured it at; drifting off them is the
+# usual cause of flaky tool calls.  Anything set in the environment still
+# wins.  context_chars is the native window less room for the reply, at
+# about 2.4 characters a token.
+PROFILES = (
+    # A coder, not a thinker: no <think> blocks, and a slight repetition
+    # penalty.  Qwen give it 65,536 tokens out of a 262,144 window.
+    ("Qwen3-Coder", ("qwen3-coder",), {
+        "temperature": 0.7, "top_p": 0.8, "top_k": 20,
+        "repetition_penalty": 1.05,
+        "max_tokens": 65536, "context_chars": 470_000}),
+    # Thinking mode, which is what the agent runs it in: its reasoning is
+    # handed back every turn, as Qwen's preserve_thinking expects.  32,768 is
+    # what Qwen ran SWE-bench with, out of a 262,144 window.
+    ("Qwen3.8", ("qwen3.8",), {
+        "temperature": 1.0, "top_p": 0.95, "top_k": 20,
+        "max_tokens": 32768, "context_chars": 550_000}),
+    ("MiniMax", ("minimax",), {
+        "temperature": 1.0, "top_p": 0.95, "top_k": 40,
+        "max_tokens": 16384, "context_chars": 480_000}),
+)
+
+
+def profile_for(model: str) -> tuple:
+    """(name, settings) for a model; MiniMax's, for one we do not know."""
+    low = model.lower()
+    for name, marks, settings in PROFILES:
+        if any(m in low for m in marks):
+            return name, settings
+    return "default", PROFILES[-1][2]
+
+
+def sampling_line() -> str:
+    """`Qwen3-Coder: temperature 0.7, top_k 20*, ...` - what this run sends,
+    with a * on each value that came from the environment, not the profile."""
+    parts = []
+    for key, val in (("temperature", TEMPERATURE), ("top_p", TOP_P),
+                     ("top_k", TOP_K), ("repetition_penalty", REPETITION_PENALTY),
+                     ("max_tokens", MAX_TOKENS), ("context_chars", CONTEXT_CHARS)):
+        if key == "repetition_penalty" and not val:
+            continue
+        mine = os.environ.get(f"AGENT_{key.upper()}", "") != ""
+        parts.append(f"{key} {val}{'*' if mine else ''}")
+    tail = "  (* from your environment)" if "*" in "".join(parts) else ""
+    return f"{PROFILE}: " + ", ".join(parts) + tail
+
+
+PROFILE, TUNED = profile_for(MODEL)
+TEMPERATURE = _env("AGENT_TEMPERATURE", TUNED["temperature"], float)
+TOP_P = _env("AGENT_TOP_P", TUNED["top_p"], float)
+TOP_K = _env("AGENT_TOP_K", TUNED["top_k"], int)
+MAX_TOKENS = _env("AGENT_MAX_TOKENS", TUNED["max_tokens"], int)
+# 0 sends none; vLLM and SGLang take it, a server that does not drops it.
+REPETITION_PENALTY = _env("AGENT_REPETITION_PENALTY",
+                          TUNED.get("repetition_penalty", 0.0), float)
 REASONING = _env("AGENT_REASONING", "")      # only for servers that take it
 TIMEOUT = _env("AGENT_TIMEOUT", 900, int)
 # Where to look for the CA certificates that vouch for the endpoint.  Read
@@ -99,7 +149,7 @@ CA_CERTS = [p for p in os.environ.get(
     "AGENT_CA_CERTS",
     "/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt").split(os.pathsep) if p]
 RETRIES = _env("AGENT_RETRIES", 5, int)
-CONTEXT_CHARS = _env("AGENT_CONTEXT_CHARS", 480_000, int)  # ~200k tokens
+CONTEXT_CHARS = _env("AGENT_CONTEXT_CHARS", TUNED["context_chars"], int)
 SHOW_THINKING = os.environ.get("AGENT_THINKING") == "1"
 AUTO_APPROVE = os.environ.get("AGENT_YOLO") == "1"
 STREAM = os.environ.get("AGENT_STREAM", "1") != "0"
@@ -121,6 +171,8 @@ RETRY_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 EXTRAS: dict = {}
 if TOP_K > 0:
     EXTRAS["top_k"] = TOP_K
+if REPETITION_PENALTY > 0:
+    EXTRAS["repetition_penalty"] = REPETITION_PENALTY
 if MINIMAX:
     # Keeps the chain of thought in `reasoning_details` instead of inside
     # `content`; either way we hand it straight back on the next turn, which
@@ -2101,6 +2153,7 @@ def main() -> None:
     load_history()
     print(bold(f"miniagent  {tilde(root)}"))
     print(dim(f"  model {MODEL} @ {BASE_URL}"))
+    print(dim(f"  tuned {sampling_line()}"))
     print(dim(f"  rules {', '.join(pol.sources)}"))
     notes = notes_files(root)
     if notes:

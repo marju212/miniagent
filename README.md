@@ -170,6 +170,33 @@ Defaults point at MiniMax's OpenAI-compatible endpoint
 `AGENT_MODEL` for any other `/v1/chat/completions` server — vLLM, SGLang,
 Ollama, OpenRouter, OpenAI.
 
+### Sampling follows the model
+
+`AGENT_MODEL` picks a profile — the settings each model's makers publish and
+measured it at — and the banner says which one, and what it sends:
+
+```
+  tuned Qwen3-Coder: temperature 0.7, top_p 0.8, top_k 20, repetition_penalty 1.05, max_tokens 65536, context_chars 470000
+```
+
+| model name contains | temperature / top_p / top_k | other | max_tokens | context_chars |
+|---|---|---|---|---|
+| `qwen3-coder` | 0.7 / 0.8 / 20 | repetition_penalty 1.05; no thinking mode | 65536 | 470000 |
+| `qwen3.8` | 1.0 / 0.95 / 20 | thinking mode, reasoning handed back every turn | 32768 | 550000 |
+| `minimax`, or anything else | 1.0 / 0.95 / 40 | `reasoning_split` | 16384 | 480000 |
+
+The name is matched case-insensitively, so `Qwen/Qwen3-Coder-30B-A3B-Instruct`
+and `qwen3-coder-plus` are both Qwen3-Coder. `context_chars` is the model's
+262k- or 200k-token window less room for the reply, at about 2.4 characters a
+token.
+
+Any of them can be overridden: whatever `AGENT_TEMPERATURE`, `AGENT_TOP_P`,
+`AGENT_TOP_K`, `AGENT_REPETITION_PENALTY`, `AGENT_MAX_TOKENS` or
+`AGENT_CONTEXT_CHARS` is set to — in your settings file or your shell — wins
+over the profile, and is marked with a `*` in the banner. The rest of the
+profile still applies. `AGENT_REPETITION_PENALTY=0` sends none; a server that
+does not know the field has it dropped automatically, like `top_k`.
+
 ## Settings
 
 `--install` and `--init` write `~/.miniagent/env` for you. The wrapper sources
@@ -490,9 +517,10 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_BASE_URL` | `https://api.minimax.io/v1` |
 | `AGENT_API_KEY` / `MINIMAX_API_KEY` | — |
 | `AGENT_MODEL` | `MiniMax-M2.5` |
-| `AGENT_TEMPERATURE` / `AGENT_TOP_P` / `AGENT_TOP_K` | `1.0` / `0.95` / `40` |
-| `AGENT_MAX_TOKENS` | `16384` |
-| `AGENT_CONTEXT_CHARS` | `480000` |
+| `AGENT_TEMPERATURE` / `AGENT_TOP_P` / `AGENT_TOP_K` | per model, see [Sampling follows the model](#sampling-follows-the-model) |
+| `AGENT_REPETITION_PENALTY` | per model; `0` sends none |
+| `AGENT_MAX_TOKENS` | per model |
+| `AGENT_CONTEXT_CHARS` | per model |
 | `AGENT_MAX_STEPS` | policy `max_steps`; may only lower it |
 | `AGENT_POLICY` | an extra rule file for one run |
 | `AGENT_CA_CERTS` | `/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt` |

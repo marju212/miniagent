@@ -2550,6 +2550,12 @@ class Wrapper(unittest.TestCase):
         r = run_wrapper("--env", home=self.home)
         self.assertEqual(r.stdout.strip(), str(self.env_file))
 
+    def test_the_settings_file_leaves_sampling_to_the_model_profile(self):
+        run_wrapper("--init", home=self.home, env={"AGENT_MODEL": "Qwen3-Coder-30B"})
+        text = self.env_file.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"(?m)^export AGENT_(TOP_K|TEMPERATURE)")
+        self.assertIn("# export AGENT_TOP_K=", text)
+
     def test_init_writes_a_private_file_and_can_be_run_again(self):
         # a second --init is how you change the model when a new one lands, so
         # it re-asks rather than refusing - and off a terminal, where there is
@@ -2793,6 +2799,54 @@ class Streaming(unittest.TestCase):
         t = agent._Text()
         self.assertEqual([t.add(x) for x in ("ab", "abcd", "abcdef")], ["ab", "cd", "ef"])
         self.assertEqual(t.text, "abcdef")
+
+
+# ---------------------------------------------------------------- profiles
+class Profiles(unittest.TestCase):
+    def test_each_family_is_recognised_by_its_name(self):
+        for model, want in (("MiniMax-M2.5", "MiniMax"),
+                            ("Qwen/Qwen3.8-27B", "Qwen3.8"),
+                            ("qwen3.8-27b-instruct-q4", "Qwen3.8"),
+                            ("Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen3-Coder"),
+                            ("qwen3-coder-plus", "Qwen3-Coder"),
+                            ("llama-3.3-70b", "default")):
+            self.assertEqual(agent.profile_for(model)[0], want, model)
+
+    def test_qwen3_coder_gets_its_published_settings(self):
+        _, s = agent.profile_for("Qwen3-Coder-480B-A35B-Instruct")
+        self.assertEqual((s["temperature"], s["top_p"], s["top_k"],
+                          s["repetition_penalty"], s["max_tokens"]),
+                         (0.7, 0.8, 20, 1.05, 65536))
+
+    def test_an_unknown_model_falls_back_to_minimax(self):
+        self.assertEqual(agent.profile_for("gpt-x")[1], agent.profile_for("minimax")[1])
+
+    def run_banner(self, env):
+        e = {**os.environ, "AGENT_STREAM": "0", **env}
+        for k in ("AGENT_TOP_K", "AGENT_TEMPERATURE", "AGENT_REPETITION_PENALTY"):
+            if k not in env:
+                e.pop(k, None)
+        RESPONSES.append({"role": "assistant", "content": "ok"})
+        REQUESTS.clear()
+        r = subprocess.run([sys.executable, str(HERE / "agent.py"), "-p", "hi",
+                            tempfile.mkdtemp()], env=e, capture_output=True,
+                           text=True, timeout=60)
+        return r.stdout, REQUESTS[-1]
+
+    def test_the_model_decides_what_is_sent(self):
+        out, sent = self.run_banner({"AGENT_MODEL": "Qwen3-Coder-30B"})
+        self.assertIn("tuned Qwen3-Coder", out)
+        self.assertEqual((sent["temperature"], sent["top_p"], sent["top_k"]),
+                         (0.7, 0.8, 20))
+        self.assertEqual(sent["repetition_penalty"], 1.05)
+        self.assertNotIn("reasoning_split", sent)
+
+    def test_the_environment_overrides_the_profile_and_says_so(self):
+        out, sent = self.run_banner({"AGENT_MODEL": "Qwen3.8-27B", "AGENT_TOP_K": "50"})
+        self.assertEqual(sent["top_k"], 50)
+        self.assertEqual(sent["temperature"], 1.0)     # the rest still Qwen's
+        self.assertIn("top_k 50*", out)
+        self.assertNotIn("repetition_penalty", sent)
 
 
 # ---------------------------------------------------------------- search tools
