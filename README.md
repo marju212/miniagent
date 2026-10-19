@@ -105,10 +105,26 @@ The agent's own `bash` tool deliberately does not do this: the policy judges the
 text of a command, and an alias is a way for the text and what actually runs to
 be two different things.
 
+Both `!cmd` and the `bash` tool run with no terminal: stdin is closed and the
+command gets a session of its own. So nothing it runs can read what you type,
+switch off echo, open an editor on your screen, or take the terminal over and
+leave the agent stopped in the background. Ctrl-c and timeouts kill everything
+the command started, not just the shell. Use a bare `!` for anything that needs
+the terminal itself.
+
 The prompt has full line editing: **up arrow** walks back through what you have
 asked before, **ctrl-r** searches it, and the history carries over between
 sessions in `~/.miniagent/history` (`0600`, since it holds whatever you asked
 for). `AGENT_HISTORY` sets how many lines are kept, default 1000.
+Pasting is safe: with GNU readline and a terminal that supports bracketed
+paste, a paste of several lines (or one very long line) shows up in the
+prompt as `[Pasted text #1 +12 lines]`, the way Claude Code does it. You can
+type around it, and nothing is sent until you press **Enter** — then the
+placeholder is swapped for the text, newlines, blank lines and indentation
+intact. A paste that starts with `/` or `!` is still just text, never a
+command. Text pasted at a permission question is ignored, so a paste can never
+answer `y` for you. **Alt-Enter** inserts a newline while typing; long input
+wraps across rows, and history keeps the full text of every message.
 
 ## Where things live
 
@@ -383,6 +399,8 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 
 !cmd             run a command yourself; ! alone opens a shell
 up arrow         an earlier prompt; ctrl-r searches them
+alt-enter        insert a newline; enter sends the whole message
+paste            several lines show as [Pasted text #1 +N lines]
 ```
 
 ```bash

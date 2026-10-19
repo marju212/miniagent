@@ -20,6 +20,7 @@ OpenRouter, OpenAI).
 """
 
 import atexit
+import ctypes
 import difflib
 import http.client
 import json
@@ -250,22 +251,42 @@ def bash_env() -> dict:
     return {**os.environ, "MINIAGENT_CWD": str(ROOTS[0])}
 
 
+def kill_group(p) -> None:
+    """Kill a child started in a session of its own, and all it started.
+
+    Killing only the child would leave a `sleep` it forked holding the pipe,
+    and reading that pipe to the end would then wait for the sleep.
+    """
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (OSError, AttributeError):
+        pass                        # gone already
+    p.kill()
+
+
 def t_bash(cmd: str, timeout: int = 120) -> str:
     cap = int(LIMITS.get("bash_timeout_max", 300))
     timeout = max(1, min(int(timeout), cap))
+    # A session of its own, with no terminal: the command cannot read what
+    # you type at the prompt, and it cannot take the terminal over - a shell
+    # that did would leave this process stopped in the background the next
+    # time it reads a key.
+    p = subprocess.Popen(
+        bash_argv(cmd), cwd=ROOTS[0], env=bash_env(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, errors="replace", start_new_session=True,
+    )
     try:
-        r = subprocess.run(
-            bash_argv(cmd), cwd=ROOTS[0], env=bash_env(), capture_output=True,
-            text=True, errors="replace", timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        # Whatever was read before the timeout comes back as raw bytes even
-        # under `text=True`, and is None if nothing was read at all.
-        got = e.stdout or b""
-        if isinstance(got, bytes):
-            got = got.decode("utf-8", "replace")
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        got, _ = p.communicate()
         return f"ERROR: timed out after {timeout}s\n--- partial stdout ---\n{got}"
-    return f"exit={r.returncode}\n--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
+    except BaseException:           # ctrl-c: it is not in our process group
+        kill_group(p)
+        p.wait()
+        raise
+    return f"exit={p.returncode}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
 
 
 TOOLS = {
@@ -405,6 +426,36 @@ def status_line(root: Path) -> str:
     return "  ".join(parts)
 
 
+TTY_MODES: list = []        # the terminal's settings as we found them
+
+
+def take_terminal_back() -> None:
+    """Be the terminal's foreground process group again, in its own modes.
+
+    Whatever ran in the bare `!` shell could have left the terminal with a
+    process group that is gone - reading the prompt would then stop us - or
+    with echo off or in raw mode, where the prompt takes keys but shows none.
+    """
+    if termios is None or not sys.stdin.isatty():
+        return
+    fd = sys.stdin.fileno()
+    try:
+        # From the background both of these raise SIGTTOU, which would stop
+        # us too.
+        old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            if os.tcgetpgrp(fd) != os.getpgrp():
+                os.tcsetpgrp(fd, os.getpgrp())
+            if not TTY_MODES:
+                TTY_MODES[:] = termios.tcgetattr(fd)
+            elif termios.tcgetattr(fd) != TTY_MODES:
+                termios.tcsetattr(fd, termios.TCSANOW, TTY_MODES)
+        finally:
+            signal.signal(signal.SIGTTOU, old)
+    except (OSError, ValueError, termios.error):
+        pass
+
+
 def shell_escape(line: str) -> str:
     """`!cmd` runs it as you, outside the policy - you typed it, the model did
     not. A bare `!` opens a shell. What came back is offered to the model with
@@ -422,13 +473,21 @@ def shell_escape(line: str) -> str:
             # too. It is meant for whatever the shell is running, not for us.
             print()
         finally:
+            take_terminal_back()
             BAR.install()
         return ""
     try:
+        # An interactive shell finds the terminal through /dev/tty even with
+        # stdin closed, makes itself the foreground group and then execs the
+        # command in its own place, so nothing ever hands the terminal back:
+        # the next key read at the prompt stops us, and you are dropped into
+        # your login shell under a status bar that is still pinned. With no
+        # controlling terminal it can only say it has no job control.
         p = subprocess.Popen(user_argv(cmd), cwd=ROOTS[0], env=bash_env(),
                              text=True, errors="replace",
                              stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             start_new_session=True)
     except OSError as e:
         warn(str(e))
         return ""
@@ -445,7 +504,7 @@ def shell_escape(line: str) -> str:
                 out.append(chunk)
             code = p.wait()
         except KeyboardInterrupt:
-            p.kill()
+            kill_group(p)
             code = -1
             print(yellow("  [interrupted]"))
     finally:
@@ -465,9 +524,24 @@ def load_history() -> None:
     """Carry the prompt's history over from previous sessions."""
     if readline is None:
         return
+    if "libedit" not in (readline.__doc__ or ""):
+        # Python disables bracketed paste by default. Enable it explicitly so
+        # pasted newlines stay in one editable message until Enter is pressed.
+        readline.parse_and_bind("set enable-bracketed-paste on")
+        readline.parse_and_bind("set horizontal-scroll-mode off")
+        readline.parse_and_bind(r'"\e\r": "\C-v\C-j"')  # Alt-Enter inserts a newline
+        catch_pastes()
     readline.set_history_length(HISTORY_LINES)
     try:
-        readline.read_history_file(HISTORY)
+        content = HISTORY.read_text(encoding="utf-8")
+        if content.startswith("# miniagent history v2\n"):
+            entries = json.loads(content.split("\n", 1)[1])
+            if not isinstance(entries, list) or not all(isinstance(s, str) for s in entries):
+                raise ValueError("invalid history")
+            for entry in entries:
+                readline.add_history(entry)
+        else:
+            readline.read_history_file(HISTORY)  # older, one-line-per-entry files
     except (OSError, ValueError):
         pass                        # none yet, or one we cannot parse
     atexit.register(save_history)
@@ -478,10 +552,94 @@ def save_history() -> None:
         return
     try:
         HISTORY.parent.mkdir(parents=True, exist_ok=True)
-        readline.write_history_file(HISTORY)
+        # A placeholder means nothing to the next session, so the paste
+        # itself is what gets kept.
+        entries = [expand_pastes(readline.get_history_item(i + 1))
+                   for i in range(readline.get_current_history_length())]
+        if HISTORY_LINES >= 0:
+            entries = entries[-HISTORY_LINES:] if HISTORY_LINES else []
+        # readline's plain-text file splits a multiline entry into separate
+        # prompts on reload. JSON keeps each submitted message together.
+        HISTORY.write_text("# miniagent history v2\n" + json.dumps(entries, ensure_ascii=False)
+                           + "\n", encoding="utf-8")
         HISTORY.chmod(0o600)        # it holds whatever you asked the agent
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------- pasting
+# A paste of several lines goes into the prompt as one short placeholder, the
+# way Claude Code shows it, and is swapped back for the text only once Enter
+# has been pressed.  So nothing pasted can ever be taken for `/` or `!`, and
+# a screenful of text does not have to be redrawn by readline on every key.
+PASTES: dict = {}           # placeholder number -> the text, for the session
+PASTE_INLINE = 500          # a single line shorter than this goes in as typed
+PASTE_RE = re.compile(r"\[Pasted text #(\d+) [^\]]*\]")
+_PASTE_END = b"\x1b[201~"
+_paste_hooks: list = []     # the ctypes callbacks; readline holds them by address
+
+
+def paste_placeholder(text: str) -> str:
+    """What a paste turns into at the prompt: itself if it is short."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.splitlines()
+    if len(lines) <= 1 and len(text) < PASTE_INLINE:
+        return text.rstrip("\n")
+    n = len(PASTES) + 1
+    PASTES[n] = text
+    size = f"+{len(lines)} lines" if len(lines) > 1 else f"{len(text)} chars"
+    return f"[Pasted text #{n} {size}]"
+
+
+def expand_pastes(line: str) -> str:
+    """Put the pasted text back where its placeholder stands."""
+    return PASTE_RE.sub(lambda m: PASTES.get(int(m.group(1)), m.group(0)), line)
+
+
+def catch_pastes() -> bool:
+    """Take over readline's bracketed-paste key, so a paste can be shown short.
+
+    Python's readline module cannot bind a key to a Python function, but GNU
+    readline itself can, and ctypes reaches it through the module's own
+    library - the very copy input() is running.  Anything that goes wrong here
+    leaves readline's own bracketed paste in charge, which still keeps the
+    paste in one message, only spelled out in full.
+    """
+    if _paste_hooks:
+        return True
+    try:
+        lib = ctypes.CDLL(readline.__file__)
+        lib.rl_insert_text.argtypes = [ctypes.c_char_p]
+        lib.rl_bind_keyseq.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+        hook = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)
+
+        def pasted(_count, _key):
+            got = bytearray()
+            while not got.endswith(_PASTE_END):
+                c = lib.rl_read_key()   # through readline: it may hold bytes
+                if c < 0:
+                    break
+                got.append(c & 0xFF)
+            if got.endswith(_PASTE_END):
+                del got[-len(_PASTE_END):]
+            text = paste_placeholder(got.decode("utf-8", "replace"))
+            if text:
+                lib.rl_insert_text(text.encode("utf-8"))
+            return 0
+
+        def cleared(count, key):    # ctrl-l would wipe the status bar too
+            lib.rl_clear_screen(count, key)
+            BAR.draw()
+            return 0
+
+        hooks = [hook(pasted), hook(cleared)]
+        if lib.rl_bind_keyseq(b"\x1b[200~", ctypes.cast(hooks[0], ctypes.c_void_p)) != 0:
+            return False
+        lib.rl_bind_keyseq(b"\x0c", ctypes.cast(hooks[1], ctypes.c_void_p))
+    except (OSError, AttributeError, TypeError):
+        return False
+    _paste_hooks[:] = hooks
+    return True
 
 
 def drop_repeat() -> None:
@@ -1158,6 +1316,8 @@ HELP = """  /help            this text
   !cmd             run a command yourself; `!` alone opens a shell
   /think           toggle showing the model's reasoning
   up arrow         an earlier prompt; ctrl-r searches them
+  alt-enter        insert a newline; enter sends the whole message
+  paste            several lines show as [Pasted text #1 +N lines]
   /cost            tokens used this session
   /retry           send the conversation again after a failed request
   /compact         shrink old tool output to make room
@@ -1406,12 +1566,17 @@ def main() -> None:
     try:
         while True:
             try:
-                print()
                 if BAR.on:
                     BAR.draw(status_line(root))
                 else:
                     print(dim(status_line(root)))
-                user = input(prompt_text(PROMPT)).strip()
+                print()
+                take_terminal_back()
+                user = input(prompt_text(PROMPT))
+                # A resize can happen while readline owns the terminal. Repair
+                # the scrolling region before the reply starts printing.
+                if BAR.on:
+                    BAR.draw()
                 drop_repeat()
             except EOFError:              # ctrl-d has only ever meant leave
                 return
@@ -1425,17 +1590,20 @@ def main() -> None:
                 print(dim("\n  (ctrl-c again to quit, or /quit)"))
                 continue
             hit_at = 0.0
-            if not user:
+            command = user.strip()
+            if not command:
                 continue
-            if user.startswith("!"):
-                got = shell_escape(user)
+            if command.startswith("!"):
+                got = shell_escape(command)
                 if got:
                     mine.append(got)
                 continue
-            if user.startswith("/"):
-                if not slash(pol, user, messages, system, mine, max_steps):
+            if command.startswith("/"):
+                if not slash(pol, command, messages, system, mine, max_steps):
                     return
                 continue
+            # Only now: a paste that starts with `/` is still a message.
+            user = expand_pastes(user)
             if mine:
                 user = ("Commands I ran myself just now:\n\n"
                         + "\n\n".join(mine) + "\n\n" + user)

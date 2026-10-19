@@ -1220,6 +1220,9 @@ class Escape(unittest.TestCase):
         self.assertEqual(self.drive(b"\x1b[Ayes\r"), "yes")
         self.assertEqual(self.drive(b"\x1bOPno\r"), "no")
 
+    def test_a_paste_never_answers_the_question(self):
+        self.assertEqual(self.drive(b"\x1b[200~y\ryes\r\x1b[201~n\r"), "n")
+
     def test_editing_and_end_of_input(self):
         self.assertEqual(self.drive(b"ab\x7fc\r"), "ac")
         self.assertEqual(self.drive(b"\x04"), "")
@@ -1394,6 +1397,87 @@ class ShellEscape(unittest.TestCase):
             agent.subprocess.run = saved
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1]["cwd"], self.root)
+
+
+class TerminalKeptToOurselves(unittest.TestCase):
+    """Nothing the agent runs may take the terminal from the prompt."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        agent.ROOTS[:] = [self.root]
+
+    def in_a_terminal(self, code: str) -> str:
+        """Run `code` with a pty as its controlling terminal, as at the prompt."""
+        prelude = ("import sys, os; sys.path.insert(0, %r); import agent; "
+                   "agent.ROOTS[:] = [__import__('pathlib').Path(%r)]\n"
+                   % (str(HERE), str(self.root)))
+        with warnings.catch_warnings():   # the child execs at once
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp(sys.executable, [sys.executable, "-c", prelude + code])
+        out = b""
+        end = time.time() + 30
+        while time.time() < end:
+            if select.select([fd], [], [], 0.2)[0]:
+                try:
+                    got = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not got:
+                    break
+                out += got
+        os.close(fd)
+        os.waitpid(pid, 0)
+        return out.decode("utf-8", "replace")
+
+    def test_a_bang_command_leaves_us_in_the_foreground(self):
+        # An interactive shell would make itself the foreground group and then
+        # exec the command, so nothing gave the terminal back: the next key
+        # read at the prompt stopped the agent.
+        got = self.in_a_terminal(
+            "agent.shell_escape('!seq 1 2')\n"
+            "print('FG' if os.tcgetpgrp(0) == os.getpgrp() else 'BG')\n")
+        self.assertIn("FG", got)
+        self.assertNotIn("BG", got)
+
+    def test_a_tool_command_has_no_terminal_to_change(self):
+        got = self.in_a_terminal(
+            "print(agent.t_bash('stty -echo </dev/tty && echo CHANGED || echo REFUSED'))\n"
+            "import termios; print('ECHO' if termios.tcgetattr(0)[3] & termios.ECHO else 'NOECHO')\n")
+        self.assertIn("REFUSED", got)
+        self.assertIn("ECHO", got.replace("NOECHO", ""))
+        self.assertNotIn("NOECHO", got)
+
+    def test_a_tool_command_cannot_read_what_you_type(self):
+        self.assertIn("got:[]", agent.t_bash("read -r x; echo got:[$x]"))
+
+    def test_a_timeout_kills_what_the_command_started_too(self):
+        start = time.monotonic()
+        with _patch(agent, "LIMITS", {**agent.LIMITS, "bash_timeout_max": 1}):
+            out = agent.t_bash("echo started; sleep 30 & wait", timeout=1)
+        self.assertIn("timed out", out)
+        self.assertIn("started", out)
+        self.assertLess(time.monotonic() - start, 10, "waited for the orphaned sleep")
+
+    def test_the_prompt_gets_the_terminal_and_its_modes_back(self):
+        got = self.in_a_terminal(
+            "import termios, signal\n"
+            "agent.take_terminal_back()\n"             # records the modes
+            "m = termios.tcgetattr(0); m[3] &= ~termios.ECHO\n"
+            "termios.tcsetattr(0, termios.TCSANOW, m)\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os.setpgid(0, 0); signal.signal(signal.SIGTTOU, signal.SIG_IGN)\n"
+            "    os.tcsetpgrp(0, os.getpgrp()); os._exit(0)\n"
+            "os.waitpid(pid, 0)\n"
+            "print('stolen' if os.tcgetpgrp(0) != os.getpgrp() else 'kept')\n"
+            "agent.take_terminal_back()\n"
+            "print('FG' if os.tcgetpgrp(0) == os.getpgrp() else 'BG')\n"
+            "print('ECHO' if termios.tcgetattr(0)[3] & termios.ECHO else 'NOECHO')\n")
+        self.assertIn("stolen", got)       # or the test proves nothing
+        self.assertIn("FG", got)
+        self.assertNotIn("NOECHO", got)
 
 
 class ShellEscapeMishaps(unittest.TestCase):
@@ -1595,9 +1679,9 @@ class Bar(unittest.TestCase):
             after = out.getvalue()[start:]
             self.bar.remove()
         self.assertIn("\033[1;11r", after)          # the region was re-cut
-        self.assertIn("\033[11;1H", after)          # and the cursor put inside it
-        self.assertLess(after.index("\033[1;11r"), after.index("\0337"),
-                        "the stale cursor was restored before it was moved")
+        self.assertIn("\033[r\0338\n\033[1A", after)
+        self.assertLess(after.index("\n\033[1A"), after.index("\033[1;11r"),
+                        "the cursor must be moved inside before reserving the bar")
 
     def test_a_window_that_grew_keeps_the_cursor_and_wipes_the_stale_bar(self):
         agent.ui._TTY = True
@@ -1612,9 +1696,34 @@ class Bar(unittest.TestCase):
             self.bar.remove()
         self.assertIn("\033[1;39r", after)          # re-cut for the taller window
         self.assertIn("\033[20;1H\033[2K", after)   # the row the old bar was on
-        # the cursor is still valid up there, so it is saved and put back
+        # Output during the resize may have reached the NEW last row. Make
+        # room with full-screen scrolling before reserving the bar again.
+        self.assertIn("\033[r\0338\n\033[1A\0337\033[1;39r", after)
         self.assertTrue(after.startswith("\0337"), repr(after[:12]))
         self.assertEqual(after.count("\0337"), after.count("\0338"))
+
+    def test_a_missed_resize_signal_still_repairs_the_region(self):
+        agent.ui._TTY = True
+        self._resize_to(20)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.bar.install()
+            self._resize_to(30)
+            start = len(out.getvalue())
+            self.bar.draw("x")
+            self.assertIn("\033[1;29r", out.getvalue()[start:])
+            self.bar.remove()
+
+    def test_a_width_only_resize_also_moves_a_bottom_row_cursor_inside(self):
+        agent.ui._TTY = True
+        self._resize_to(20)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.bar.install()
+            self.bar._resized()
+            start = len(out.getvalue())
+            self.bar.draw("x")
+            self.assertIn("\033[r\0338\n\033[1A\0337\033[1;19r",
+                          out.getvalue()[start:])
+            self.bar.remove()
 
     def test_the_bar_is_only_handed_to_atexit_once(self):
         # `!` removes and re-installs the bar every time it is used
@@ -1710,6 +1819,67 @@ class StatusLine(unittest.TestCase):
         self.assertEqual(agent.tilde(Path("/opt/x")), "/opt/x")
 
 
+# ---------------------------------------------------------------- pasting
+class Pasting(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(agent.PASTES)
+        agent.PASTES.clear()
+
+    def tearDown(self):
+        agent.PASTES.clear()
+        agent.PASTES.update(self.saved)
+
+    def test_a_short_line_goes_in_as_typed(self):
+        self.assertEqual(agent.paste_placeholder("git status\n"), "git status")
+        self.assertEqual(agent.PASTES, {})
+
+    def test_several_lines_become_one_placeholder(self):
+        text = "/quit\n!rm -rf x\n\n  indented\r\n"
+        shown = agent.paste_placeholder(text)
+        self.assertEqual(shown, "[Pasted text #1 +4 lines]")
+        self.assertEqual(agent.expand_pastes(f"look at {shown} please"),
+                         "look at /quit\n!rm -rf x\n\n  indented\n please")
+
+    def test_a_long_single_line_is_counted_in_characters(self):
+        self.assertEqual(agent.paste_placeholder("x" * 600), "[Pasted text #1 600 chars]")
+
+    def test_a_placeholder_it_never_handed_out_is_left_alone(self):
+        self.assertEqual(agent.expand_pastes("[Pasted text #9 +2 lines]"),
+                         "[Pasted text #9 +2 lines]")
+
+    @unittest.skipUnless(agent.readline is not None
+                         and "libedit" not in (agent.readline.__doc__ or ""),
+                         "needs GNU readline")
+    def test_readline_shows_the_placeholder_and_hands_back_the_text(self):
+        code = ("import sys; sys.path.insert(0, %r); import agent\n"
+                "assert agent.catch_pastes()\n"
+                "line = input('> ')\n"
+                "print('GOT', repr(line), repr(agent.expand_pastes(line)))\n"
+                % str(Path(agent.__file__).parent))
+        with warnings.catch_warnings():   # the child execs at once
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp(sys.executable, [sys.executable, "-c", code])
+        out = b""
+        try:
+            time.sleep(0.5)
+            os.write(fd, b"see \x1b[200~/quit\nline two\x1b[201~ ok\r")
+            end = time.time() + 5
+            while b"GOT" not in out or not out.endswith(b"\n"):
+                if time.time() > end:
+                    break
+                if select.select([fd], [], [], 0.1)[0]:
+                    try:
+                        out += os.read(fd, 4096)
+                    except OSError:
+                        break
+        finally:
+            os.close(fd)
+            os.waitpid(pid, 0)
+        self.assertIn(b"GOT 'see [Pasted text #1 +2 lines] ok' 'see /quit\\nline two ok'", out)
+
+
 # ---------------------------------------------------------------- history
 @unittest.skipUnless(agent.readline is not None, "needs readline")
 class History(unittest.TestCase):
@@ -1747,6 +1917,32 @@ class History(unittest.TestCase):
         agent.drop_repeat()                 # remove_history_item is not
         self.assertEqual(agent.readline.get_current_history_length(), 2)
 
+    def test_multiline_messages_survive_a_session_as_single_entries(self):
+        entries = ["  first\n\n\tsecond\n", "café\nnext task"]
+        for entry in entries:
+            agent.readline.add_history(entry)
+        agent.save_history()
+        agent.readline.clear_history()
+        agent.load_history()
+        self.assertEqual(agent.readline.get_current_history_length(), 2)
+        self.assertEqual([agent.readline.get_history_item(i + 1) for i in range(2)], entries)
+
+    def test_old_history_files_are_still_loaded(self):
+        agent.HISTORY.write_text("first task\nsecond task\n", encoding="utf-8")
+        agent.load_history()
+        self.assertEqual(agent.readline.get_history_item(1), "first task")
+        self.assertEqual(agent.readline.get_history_item(2), "second task")
+
+    def test_history_limit_counts_messages_including_multiline_ones(self):
+        for entry in ("old", "keep\nall lines", "last"):
+            agent.readline.add_history(entry)
+        with _patch(agent, "HISTORY_LINES", 2):
+            agent.save_history()
+        agent.readline.clear_history()
+        agent.load_history()
+        self.assertEqual(agent.readline.get_current_history_length(), 2)
+        self.assertEqual(agent.readline.get_history_item(1), "keep\nall lines")
+
     def test_missing_and_unreadable_files_are_survivable(self):
         agent.load_history()                             # no file yet
         agent.HISTORY.parent.mkdir(parents=True, exist_ok=True)
@@ -1771,10 +1967,112 @@ class ArrowKeys(unittest.TestCase):
         end = time.time() + seconds
         while time.time() < end:
             if select.select([master], [], [], 0.2)[0]:
-                self.buf += os.read(master, 4096).decode("utf-8", "replace")
+                try:
+                    got = os.read(master, 4096)
+                except OSError:          # EIO: everything at the other end exited
+                    return bool(re.search(pattern, self.buf))
+                self.buf += got.decode("utf-8", "replace")
                 if re.search(pattern, self.buf):
                     return True
         return False
+
+    def start_input(self):
+        RESPONSES.clear()
+        REQUESTS.clear()
+        home = tempfile.TemporaryDirectory()
+        proj = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.addCleanup(proj.cleanup)
+        # The CLI must explicitly override settings that split paste or keep
+        # long input on one horizontally scrolling row.
+        (Path(home.name) / ".inputrc").write_text(
+            "set enable-bracketed-paste off\nset horizontal-scroll-mode on\n")
+        master, slave = pty.openpty()
+        import fcntl
+        import struct
+        fcntl.ioctl(slave, agent.termios.TIOCSWINSZ, struct.pack("HHHH", 24, 60, 0, 0))
+        self.buf = ""
+        env = {"PATH": os.environ["PATH"], "HOME": home.name, "TERM": "xterm",
+               "AGENT_BASE_URL": os.environ["AGENT_BASE_URL"], "AGENT_API_KEY": "x"}
+        proc = subprocess.Popen([sys.executable, str(HERE / "agent.py"), proj.name],
+                                stdin=slave, stdout=slave, stderr=slave, env=env)
+        os.close(slave)
+
+        def close():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+            os.close(master)
+        self.addCleanup(close)
+        self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+        self.assertIn("\033[?2004h", self.buf)
+        self.buf = ""
+        return proc, master
+
+    @unittest.skipUnless(agent.readline and "libedit" not in agent.readline.__doc__,
+                         "needs GNU readline")
+    def test_multiline_paste_shows_a_placeholder_and_sends_the_text(self):
+        proc, master = self.start_input()
+        message = "  first\n\n\tsecond café\n  third\n"
+        os.write(master, b"\x1b[200~" + message.encode() + b"\x1b[201~")
+        # shown as a placeholder, sent as the text itself
+        self.assertTrue(self.read_until(master, re.escape("[Pasted text #1 +4 lines]")),
+                        self.buf)
+        self.assertNotIn("third", self.buf)
+        self.assertEqual(REQUESTS, [], "paste submitted before Enter")
+        self.buf = ""
+        os.write(master, b"\r")
+        self.assertTrue(self.read_until(master, "agent> "), self.buf)
+        self.assertEqual(len(REQUESTS), 1)
+        self.assertEqual(REQUESTS[0]["messages"][-1]["content"], message)
+        self.buf = ""
+        os.write(master, b"\x1b[A\r")
+        self.assertTrue(self.read_until(master, "agent> "), self.buf)
+        self.assertEqual(len(REQUESTS), 2)
+        self.assertEqual(REQUESTS[1]["messages"][-1]["content"], message)
+        os.write(master, b"/quit\r")
+        self.assertEqual(proc.wait(timeout=10), 0)
+
+    @unittest.skipUnless(agent.readline and "libedit" not in agent.readline.__doc__,
+                         "needs GNU readline")
+    def test_alt_enter_adds_a_newline_and_long_input_wraps(self):
+        proc, master = self.start_input()
+        first = "a" * 90
+        os.write(master, first.encode() + b"\x1b\rsecond")
+        self.assertTrue(self.read_until(master, "second"), self.buf)
+        self.assertEqual(REQUESTS, [])
+        # All 90 characters are displayed (the terminal wraps them at column
+        # 60); horizontal scrolling would instead display only the tail.
+        # readline 7 (AlmaLinux 8) puts a \r at the wrap; the screen is the same
+        self.assertIn(first, self.buf.replace("\r", ""))
+        self.assertIn("\n", self.buf)  # the explicit Alt-Enter newline
+        self.buf = ""
+        os.write(master, b"\r")
+        self.assertTrue(self.read_until(master, "agent> "), self.buf)
+        self.assertEqual(REQUESTS[0]["messages"][-1]["content"], first + "\nsecond")
+        os.write(master, b"/quit\r")
+        self.assertEqual(proc.wait(timeout=10), 0)
+
+    @unittest.skipUnless(agent.readline and "libedit" not in agent.readline.__doc__,
+                         "needs GNU readline")
+    def test_resize_during_input_repairs_scrolling_before_the_reply(self):
+        import fcntl
+        import struct
+        proc, master = self.start_input()
+        for rows in (12, 40):
+            with self.subTest(rows=rows):
+                self.buf = ""
+                fcntl.ioctl(master, agent.termios.TIOCSWINSZ,
+                            struct.pack("HHHH", rows, 60, 0, 0))
+                proc.send_signal(signal.SIGWINCH)
+                os.write(master, b"say hi\r")
+                self.assertTrue(self.read_until(master, "agent> "), self.buf)
+                region = f"\033[1;{rows - 1}r"
+                self.assertIn(region, self.buf)
+                self.assertIn("\033[r\0338\r\n\033[1A", self.buf)
+                self.assertLess(self.buf.index(region), self.buf.index("done"))
+        os.write(master, b"/quit\r")
+        self.assertEqual(proc.wait(timeout=10), 0)
 
     def test_arrow_up_recalls_the_previous_prompt(self):
         RESPONSES.clear()
@@ -1815,14 +2113,30 @@ class Leaving(unittest.TestCase):
         end = time.time() + seconds
         while time.time() < end:
             if select.select([master], [], [], 0.2)[0]:
-                self.buf += os.read(master, 4096).decode("utf-8", "replace")
+                try:
+                    got = os.read(master, 4096)
+                except OSError:          # EIO: everything at the other end exited
+                    return bool(re.search(pattern, self.buf))
+                self.buf += got.decode("utf-8", "replace")
                 if re.search(pattern, self.buf):
                     return True
         return False
 
+    def at_prompt(self, master, pattern=r"agent> "):
+        self.assertTrue(self.read_until(master, pattern), self.buf)
+        # Not the instant the prompt shows: a signal landing between readline
+        # printing it and blocking in select() is only seen at the next key
+        # (a CPython race), and no key comes here.
+        time.sleep(0.3)
+
     def start(self):
         home, proj = tempfile.mkdtemp(), tempfile.mkdtemp()
         master, slave = pty.openpty()
+        # A size of 0x0 gets no status bar on Python < 3.11, whose
+        # get_terminal_size() does not fall back to 80x24 for it.
+        import fcntl
+        import struct
+        fcntl.ioctl(slave, agent.termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         self.buf = ""
         env = {"PATH": os.environ["PATH"], "HOME": home, "TERM": "xterm",
                "AGENT_BASE_URL": os.environ["AGENT_BASE_URL"], "AGENT_API_KEY": "x"}
@@ -1835,13 +2149,13 @@ class Leaving(unittest.TestCase):
 
     def test_one_ctrl_c_keeps_the_session_and_two_leave(self):
         proc, master = self.start()
-        self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+        self.at_prompt(master)
         proc.send_signal(signal.SIGINT)
         self.assertTrue(self.read_until(master, r"ctrl-c again"), self.buf)
         self.assertIsNone(proc.poll(), "one ctrl-c should not have ended it")
         # ... and it still takes a prompt afterwards
         os.write(master, b"say hi\r")
-        self.assertTrue(self.read_until(master, r"done"), self.buf)
+        self.at_prompt(master, r"done[\s\S]*agent> ")  # both presses land there
         proc.send_signal(signal.SIGINT)
         time.sleep(0.3)
         proc.send_signal(signal.SIGINT)
@@ -1849,7 +2163,7 @@ class Leaving(unittest.TestCase):
 
     def test_a_lone_ctrl_c_long_after_the_first_still_does_not_quit(self):
         proc, master = self.start()
-        self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+        self.at_prompt(master)
         proc.send_signal(signal.SIGINT)
         self.assertTrue(self.read_until(master, r"ctrl-c again"), self.buf)
         time.sleep(2.2)                     # past the window
@@ -1866,7 +2180,7 @@ class Leaving(unittest.TestCase):
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
             with self.subTest(signal=sig.name):
                 proc, master = self.start()
-                self.assertTrue(self.read_until(master, r"agent> "), self.buf)
+                self.at_prompt(master)
                 self.buf = ""
                 proc.send_signal(sig)
                 self.assertTrue(self.read_until(master, r"\033\[r", seconds=10)

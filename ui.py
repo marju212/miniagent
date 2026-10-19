@@ -116,6 +116,8 @@ class StatusBar:
         # DECSTBM homes the cursor, so save and restore it around the change.
         emit(f"\n\033[1A\0337\033[1;{rows - 1}r\0338")
         self.on = True
+        self.stale = False
+        self.row = rows
         if not self.registered:     # `!` re-installs the bar on every use
             self.registered = True
             atexit.register(self.remove)
@@ -140,29 +142,22 @@ class StatusBar:
             return
         size = shutil.get_terminal_size()
         recut = ""
-        if self.stale:                       # the terminal was resized
+        if self.stale or size.lines != self.row:  # also tolerate a missed SIGWINCH
             self.stale = False
             if size.lines < 3:
                 self.remove()
                 return
-            if 0 < self.row and size.lines < self.row:
-                # The window got shorter, so the terminal clamped the cursor to
-                # the new last row - which is the bar's own, outside the region
-                # about to be cut.  Restoring it there strands the prompt where
-                # a line cannot scroll: every reply after that overwrites the
-                # prompt instead of appearing above it, and the next draw wipes
-                # what is left, so the session looks dead while it is fine.
-                # So place the cursor rather than restore it.  draw() only ever
-                # runs just before the prompt, which is where it belongs.
-                recut = (f"\033[1;{size.lines - 1}r"
-                         f"\033[{size.lines - 1};1H\033[2K")
-            else:
-                # Taller, or only wider: the cursor is still somewhere valid,
-                # so put it back.  What the old row holds now is a stale copy
-                # of the bar, stranded mid-screen; clear it on the way past.
-                ghost = (f"\033[{self.row};1H\033[2K"
-                         if 0 < self.row < size.lines else "")
-                recut = f"\0337{ghost}\033[1;{size.lines - 1}r\0338"
+            # Any resize can leave the cursor on the physical last row, even
+            # growth: readline/output may have filled the enlarged screen
+            # before this draw. Restoring that row outside the new scrolling
+            # region strands all subsequent output on a single line.
+            # Restore full-screen scrolling first, then make room just as in
+            # install(). Newline + up leaves the cursor at most one row above
+            # the bottom, without erasing the last line of the conversation.
+            ghost = (f"\033[{self.row};1H\033[2K"
+                     if 0 < self.row < size.lines else "")
+            recut = (f"\0337{ghost}\033[r\0338\n\033[1A"
+                     f"\0337\033[1;{size.lines - 1}r\0338")
         # not _short(): it collapses runs of spaces, and the gaps between the
         # fields are what makes the bar readable
         room = max(1, size.columns - 2)
@@ -245,6 +240,11 @@ def read_answer(prompt: str):
         # TCSAFLUSH: anything typed before the prompt appeared is dropped
         # rather than allowed to answer a permission question by accident.
         tty.setcbreak(fd)
+        # Bracketed paste, so a paste can be told apart from typing: pasted
+        # text must never be what answers a permission question.
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?2004h")
+            sys.stdout.flush()
         while True:
             ch = getch()
             if not ch:                        # end of input
@@ -258,10 +258,19 @@ def read_answer(prompt: str):
                 # draining everything available would eat the line behind it.
                 nxt = getch()
                 if nxt == "[":                # CSI: parameters, then a final byte
+                    seq = ""
                     while True:
                         end = getch()
+                        seq += end
                         if not end or "@" <= end <= "~":
                             break
+                    if seq == "200~":         # a paste: drop all of it
+                        tail = ""
+                        while not tail.endswith("\x1b[201~"):
+                            end = getch()
+                            if not end:
+                                break
+                            tail = (tail + end)[-6:]
                 elif nxt == "O":              # SS3: one byte follows
                     getch()
                 elif nxt:
@@ -287,6 +296,9 @@ def read_answer(prompt: str):
             sys.stdout.write(ch)
             sys.stdout.flush()
     finally:
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?2004l")
+            sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
