@@ -70,6 +70,11 @@ Type your task at the `agent>` prompt. The agent reads, edits and runs commands
 to do it, asking you before anything the rules do not already cover. `/help`
 lists the commands, `ctrl-c` twice leaves. `AGENT_PROMPT` renames the prompt.
 
+The reply is printed as it streams in, so a long answer starts showing at once
+rather than after the whole of it has been written. A server that will not
+stream is detected and simply answers in one piece; `AGENT_STREAM=0` asks for
+that from the start.
+
 Every call says what it did: the exit status and the ends of the output for a
 command, `+N -M` for an edit. `AGENT_RESULT_LINES` sets how much is shown,
 default 6; `0` goes back to naming the call and nothing else.
@@ -483,6 +488,7 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_HISTORY` | `1000` lines kept |
 | `AGENT_DIFF_LINES` | `24` lines of diff at a permission prompt; `0` hides it |
 | `AGENT_RESULT_LINES` | `6` lines of tool output; `0` hides it |
+| `AGENT_STREAM` | on; `0` waits for the whole reply |
 
 ## Tests
 

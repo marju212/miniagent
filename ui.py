@@ -343,6 +343,110 @@ def diff_lines(before: str, after: str, max_lines: int = 24) -> list:
     return out
 
 
+# ---------------------------------------------------------------- live reply
+class LiveReply:
+    """Prints a reply while it streams in, the way `render` prints a whole one.
+
+    The text is shown as it arrives; the reasoning only when asked for, dim
+    and indented.  An inline `<think>` block and raw `<minimax:tool_call>`
+    markup are kept off the screen, a tag split across two chunks included.
+    Only the screen is filtered: the transcript keeps every byte.
+    """
+
+    TAGS = ("<think>", "</think>", "<minimax:tool_call>", "</minimax:tool_call>")
+
+    def __init__(self, show_thinking: bool):
+        self.show = show_thinking
+        self.buf = ""           # held back: it may be the start of a tag
+        self.mode = "text"      # text | think | call
+        self.spoke = False      # any visible text printed yet
+        self.mused = False      # any reasoning printed yet
+        self.gap = ""           # trailing whitespace, held until text follows
+        self.col0 = True        # the cursor is at the start of a line
+        self.last = ""          # "think" or "text": what was printed last
+
+    def _write(self, s: str) -> None:
+        if s:
+            try:
+                sys.stdout.write(s)
+                sys.stdout.flush()
+            except OSError:
+                # A closed pipe on our side is not the request failing: let
+                # the reply finish arriving, rather than be retried for it.
+                self.show, self.mode = False, "call"
+            self.col0 = s.endswith("\n")
+
+    def think(self, s: str) -> None:
+        if not self.show or not s:
+            return
+        if not self.mused:
+            s = s.lstrip()
+            if not s:
+                return
+            self.mused = True
+        if self.last != "think":
+            if not self.col0:
+                self._write("\n")
+            self.last = "think"
+        for piece in s.splitlines(keepends=True):
+            body = piece.rstrip("\n")
+            lead = "  " if self.col0 and body else ""
+            self._write(lead + (dim(body) if body else "")
+                        + ("\n" if piece.endswith("\n") else ""))
+
+    def _say(self, s: str) -> None:
+        if not self.spoke:
+            s = s.lstrip()
+            if not s:
+                return
+            self._write(("" if self.col0 else "\n") + "\n")
+            self.spoke = True
+        elif self.last != "text":
+            self._write("" if self.col0 else "\n")
+            self.gap = self.gap.lstrip(" \t")
+        self.last = "text"
+        # Trailing whitespace waits for whatever follows it, so the reply ends
+        # where `render`'s strip() would have ended it.
+        s = self.gap + s
+        body = s.rstrip()
+        self.gap = s[len(body):]
+        self._write(body)
+
+    def _route(self, s: str) -> None:
+        if not s or self.mode == "call":
+            return
+        if self.mode == "think":
+            self.think(s)
+        else:
+            self._say(s)
+
+    def text(self, s: str) -> None:
+        self.buf += s
+        while self.buf:
+            i = self.buf.find("<")
+            if i == -1:
+                self._route(self.buf)
+                self.buf = ""
+                return
+            self._route(self.buf[:i])
+            self.buf = self.buf[i:]
+            tag = next((t for t in self.TAGS if self.buf.startswith(t)), None)
+            if tag:
+                self.mode = {"<think>": "think", "<minimax:tool_call>": "call"}.get(tag, "text")
+                self.buf = self.buf[len(tag):]
+            elif any(t.startswith(self.buf) for t in self.TAGS):
+                return              # wait for the rest of what may be a tag
+            else:
+                self._route("<")
+                self.buf = self.buf[1:]
+
+    def finish(self) -> None:
+        held, self.buf = self.buf, ""
+        self._route(held)
+        if not self.col0:
+            self._write("\n")
+
+
 # ---------------------------------------------------------------- tool calls
 def tool_line(name: str, args: dict, subject_key: str = "") -> str:
     """`bash(pytest -q)` - the same shape the permission prompt and /policy

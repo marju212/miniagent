@@ -43,12 +43,25 @@ os.environ.pop("AGENT_YOLO", None)
 RESPONSES: list = []   # assistant messages the stub hands back, in order
 REQUESTS: list = []    # request bodies the agent sent
 FAULTS: list = []      # (status, body) pairs to answer with first, in order
+STREAMS: list = []     # lists of SSE chunks, answered to a streaming request
 
 
 class _Stub(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         REQUESTS.append(body)
+        if STREAMS and body.get("stream"):
+            chunks = STREAMS.pop(0)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for c in chunks:
+                line = c if isinstance(c, str) else "data: " + json.dumps(c)
+                self.wfile.write((line + "\n\n").encode())
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.close_connection = True
+            return
         if FAULTS:
             status, doc = FAULTS.pop(0)
             out = doc.encode() if isinstance(doc, str) else json.dumps(doc).encode()
@@ -2664,6 +2677,123 @@ class Wrapper(unittest.TestCase):
         self.env_file.chmod(0o644)
         r = run_wrapper("--rules", str(self.proj), home=self.home)
         self.assertIn("readable by others", r.stderr)
+
+# ---------------------------------------------------------------- streaming
+def _delta(**d):
+    return {"choices": [{"index": 0, "delta": d}]}
+
+
+class Streaming(unittest.TestCase):
+    def setUp(self):
+        RESPONSES.clear()
+        REQUESTS.clear()
+        STREAMS.clear()
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        (self.root / "hello.txt").write_text("hi there\n", encoding="utf-8")
+        agent.ROOTS[:] = [self.root]
+
+    def turn(self, *streams, show_thinking=False):
+        STREAMS.extend(streams)
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+        with _patch(agent, "EXTRAS", {"stream": True}), \
+                _patch(agent, "SHOW_THINKING", show_thinking), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.run_turn(make_policy(allow=["read_file(**)"]), msgs, 5)
+        return msgs, out.getvalue()
+
+    def test_text_is_put_back_together_and_printed_once(self):
+        msgs, out = self.turn([_delta(role="assistant", content=""),
+                               _delta(content="Hello"), _delta(content=", world"),
+                               {"choices": [], "usage": {"prompt_tokens": 3,
+                                                         "completion_tokens": 2}}])
+        self.assertEqual(msgs[-1]["content"], "Hello, world")
+        self.assertEqual(out.count("Hello, world"), 1)
+        self.assertTrue(REQUESTS[0]["stream"])
+
+    def test_tool_call_fragments_are_joined(self):
+        msgs, _ = self.turn(
+            [_delta(tool_calls=[{"index": 0, "id": "c1", "type": "function",
+                                 "function": {"name": "read_file", "arguments": ""}}]),
+             _delta(tool_calls=[{"index": 0, "function": {"arguments": '{"pa'}}]),
+             _delta(tool_calls=[{"index": 0, "function": {"arguments": 'th": "hello.txt"}'}}])],
+            [_delta(content="done")])
+        call = msgs[2]["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "read_file")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"path": "hello.txt"})
+        self.assertIn("hi there", msgs[3]["content"])
+
+    def test_cumulative_reasoning_details_are_not_doubled(self):
+        # MiniMax resends the whole reasoning so far in every chunk.
+        msgs, _ = self.turn([
+            _delta(reasoning_details=[{"type": "reasoning.text", "text": "I should"}]),
+            _delta(reasoning_details=[{"type": "reasoning.text", "text": "I should say hi"}]),
+            _delta(content="hi")])
+        self.assertEqual(msgs[-1]["reasoning_details"],
+                         [{"type": "reasoning.text", "text": "I should say hi"}])
+        # and it goes back to the model verbatim on the next request
+        self.assertEqual(agent.wire(msgs)[-1]["reasoning_details"][0]["text"],
+                         "I should say hi")
+
+    def test_think_tags_split_across_chunks_stay_off_the_screen(self):
+        msgs, out = self.turn([_delta(content="<thi"), _delta(content="nk>secret plan</th"),
+                               _delta(content="ink>\n\nThe answer")])
+        self.assertIn("The answer", out)
+        self.assertNotIn("secret", out)
+        self.assertIn("secret plan", msgs[-1]["content"])   # kept for the model
+
+    def test_reasoning_is_shown_when_asked(self):
+        _, out = self.turn([_delta(reasoning_content="pondering"), _delta(content="ok")],
+                           show_thinking=True)
+        self.assertIn("pondering", out)
+        self.assertLess(out.index("pondering"), out.index("ok"))
+
+    def test_raw_tool_markup_is_hidden_and_still_run(self):
+        markup = ('<minimax:tool_call>\n<invoke name="read_file">\n'
+                  '<parameter name="path">hello.txt</parameter>\n</invoke>\n'
+                  '</minimax:tool_call>')
+        with contextlib.redirect_stderr(io.StringIO()):
+            msgs, out = self.turn([_delta(content="Reading. " + markup[:20]),
+                                   _delta(content=markup[20:])],
+                                  [_delta(content="done")])
+        self.assertNotIn("invoke", out)
+        self.assertIn("hi there", msgs[3]["content"])
+
+    def test_an_error_event_is_an_api_error(self):
+        STREAMS.append([{"error": {"message": "insufficient balance"}}])
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        with _patch(agent, "EXTRAS", {"stream": True}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(agent.ApiError) as e:
+                agent.run_turn(make_policy(), msgs, 5)
+        self.assertIn("credit", str(e.exception))
+
+    def test_a_server_that_answers_in_one_piece_still_works(self):
+        RESPONSES.append({"role": "assistant", "content": "whole"})
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        with _patch(agent, "EXTRAS", {"stream": True}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.run_turn(make_policy(), msgs, 5)
+        self.assertEqual(msgs[-1]["content"], "whole")
+        self.assertIn("whole", out.getvalue())
+
+    def test_a_closed_stdout_is_not_taken_for_a_failed_request(self):
+        class Closed(io.StringIO):
+            def write(self, _s):
+                raise BrokenPipeError(32, "Broken pipe")
+        live = ui.LiveReply(True)
+        with _patch(sys, "stdout", Closed()):
+            live.think("hm")
+            live.text("hello")
+            live.finish()               # nothing raised
+
+    def test_text_fields_detect_whole_and_delta_streams(self):
+        t = agent._Text()
+        self.assertEqual([t.add(x) for x in ("ab", "cd", "ef")], ["ab", "cd", "ef"])
+        self.assertEqual(t.text, "abcdef")
+        t = agent._Text()
+        self.assertEqual([t.add(x) for x in ("ab", "abcd", "abcdef")], ["ab", "cd", "ef"])
+        self.assertEqual(t.text, "abcdef")
+
 
 # ---------------------------------------------------------------- search tools
 class Search(unittest.TestCase):

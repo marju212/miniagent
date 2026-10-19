@@ -99,6 +99,7 @@ RETRIES = _env("AGENT_RETRIES", 5, int)
 CONTEXT_CHARS = _env("AGENT_CONTEXT_CHARS", 480_000, int)  # ~200k tokens
 SHOW_THINKING = os.environ.get("AGENT_THINKING") == "1"
 AUTO_APPROVE = os.environ.get("AGENT_YOLO") == "1"
+STREAM = os.environ.get("AGENT_STREAM", "1") != "0"
 
 MINIMAX = "minimax" in (MODEL + BASE_URL).lower()
 GLOBAL_POLICY = Path.home() / ".miniagent" / "policy.json"
@@ -120,6 +121,12 @@ if MINIMAX:
     # `content`; either way we hand it straight back on the next turn, which
     # is what M2.x needs to stay coherent across tool calls.
     EXTRAS["reasoning_split"] = True
+if STREAM:
+    # Optional like the rest: a server that refuses to stream answers in one
+    # piece once these are dropped.  stream_options goes first, so a complaint
+    # naming it is not taken for one about `stream` itself.
+    EXTRAS["stream_options"] = {"include_usage": True}
+    EXTRAS["stream"] = True
 
 # Filled in once the policy is loaded; the defaults keep the module importable.
 LIMITS = dict(pol_mod.DEFAULTS["limits"])
@@ -1292,7 +1299,116 @@ def ssl_context():
     return _SSL_CTX
 
 
-def llm(messages: list, tools: list) -> dict:
+class _Text:
+    """One streamed field, put back together.
+
+    Most servers send each chunk's new text; some - MiniMax's reasoning among
+    them - resend everything so far.  The second chunk tells which: one that
+    begins with all that came before and goes further is the whole text again.
+    """
+
+    def __init__(self):
+        self.text = ""
+        self.whole = None
+
+    def add(self, piece) -> str:
+        """Take a chunk in; give back what it added."""
+        if not isinstance(piece, str) or not piece:
+            return ""
+        if self.whole is None and self.text:
+            self.whole = len(piece) > len(self.text) and piece.startswith(self.text)
+        if self.whole and piece.startswith(self.text):
+            new, self.text = piece[len(self.text):], piece
+            return new
+        self.text += piece
+        return piece
+
+
+REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+
+def read_stream(r, live) -> dict:
+    """A server-sent event stream, folded back into the body a non-streamed
+    request would have got - so everything after it is the same code."""
+    content, fields, details, calls = _Text(), {}, {}, {}
+    usage, base = None, None
+    for raw in r:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue                # blank separators, `: keep-alive` comments
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("error"):
+            raise ApiError(explain(0, json.dumps(chunk["error"])))
+        if isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
+        if isinstance(chunk.get("base_resp"), dict) and chunk["base_resp"].get("status_code"):
+            base = chunk["base_resp"]
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            continue
+        delta = choices[0].get("delta") or choices[0].get("message") or {}
+        if not isinstance(delta, dict):
+            continue
+        for key in REASONING_KEYS:
+            if isinstance(delta.get(key), str):
+                new = fields.setdefault(key, _Text()).add(delta[key])
+                if live:
+                    live.think(new)
+        for n, d in enumerate(delta.get("reasoning_details") or []):
+            if not isinstance(d, dict):
+                continue
+            meta, text = details.setdefault(d.get("index", n), ({}, _Text()))
+            meta.update({k: v for k, v in d.items() if k not in ("text", "index")})
+            new = text.add(d.get("text"))
+            if live:
+                live.think(new)
+        new = content.add(delta.get("content"))
+        if live and new:
+            live.text(new)
+        for n, tc in enumerate(delta.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            key = tc.get("index", tc.get("id", n))
+            c = calls.setdefault(key, {"id": "", "name": "", "args": _Text()})
+            c["id"] = tc.get("id") or c["id"]
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            # A name is one word; some servers repeat it in every chunk.
+            if isinstance(name, str) and name and name != c["name"]:
+                c["name"] += name
+            c["args"].add(fn.get("arguments"))
+
+    msg = {"role": "assistant", "content": content.text}
+    for key, t in fields.items():
+        if t.text:
+            msg[key] = t.text
+    if details:
+        msg["reasoning_details"] = [{**meta, "text": t.text}
+                                    for meta, t in details.values()]
+    if calls:
+        msg["tool_calls"] = [
+            {"id": c["id"] or f"call_{i + 1}", "type": "function",
+             "function": {"name": c["name"], "arguments": c["args"].text}}
+            for i, c in enumerate(calls.values())]
+    body = {"choices": [{"message": msg}], "_streamed": True}
+    if usage is not None:
+        body["usage"] = usage
+    if base is not None:
+        body["base_resp"] = base
+    return body
+
+
+def llm(messages: list, tools: list, show: bool = True) -> dict:
+    """One reply from the model.  With `show`, a streamed reply is printed as
+    it arrives, and the message comes back marked `_shown`."""
     last = "no attempt was made"
     tries = max(1, RETRIES)
     attempt = 0                 # counts *failures*, not requests; see `dropped`
@@ -1306,7 +1422,15 @@ def llm(messages: list, tools: list) -> dict:
         try:
             with urllib.request.urlopen(
                     req, timeout=TIMEOUT, context=ssl_context()) as r:
-                body = json.loads(r.read())
+                if "event-stream" in (r.headers.get("Content-Type") or ""):
+                    live = ui.LiveReply(SHOW_THINKING) if show else None
+                    try:
+                        body = read_stream(r, live)
+                    finally:
+                        if live:
+                            live.finish()
+                else:
+                    body = json.loads(r.read())
         except urllib.error.HTTPError as e:
             text = e.read().decode("utf-8", "replace")[:800]
             dropped = _drop_rejected(e.code, text)
@@ -1374,6 +1498,8 @@ def llm(messages: list, tools: list) -> dict:
             raise ApiError(last, code)
         msg = _shape(body)
         USAGE.add(body.get("usage"))
+        if body.get("_streamed") and show:
+            msg["_shown"] = True
         return msg
     raise ApiError(f"gave up after {tries} failed requests: {last}")
 
@@ -1504,8 +1630,9 @@ def run_turn(pol, messages: list, max_steps: int) -> None:
     for _ in range(max_steps):
         compact(messages, CONTEXT_CHARS)
         msg = llm(messages, tools)
+        if not msg.pop("_shown", False):
+            render(msg)
         messages.append(dict(msg))
-        render(msg)
 
         calls = msg.get("tool_calls") or []
         if not calls:
