@@ -2919,6 +2919,66 @@ class Todo(unittest.TestCase):
         self.assertTrue(any("[ ] a" in l for l in lines))
 
 
+# ---------------------------------------------------------------- compaction
+class Summarising(unittest.TestCase):
+    def setUp(self):
+        RESPONSES.clear()
+        REQUESTS.clear()
+        STREAMS.clear()
+
+    def convo(self):
+        return [{"role": "system", "content": "sys"},
+                {"role": "user", "content": "first task"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "x" * 5000},
+                {"role": "assistant", "content": "did it"},
+                {"role": "user", "content": "second task"}]
+
+    def test_earlier_turns_become_a_summary(self):
+        RESPONSES.append({"role": "assistant", "content": "<think>hm</think>We did the first task."})
+        msgs = self.convo()
+        with _patch(agent, "EXTRAS", {}):
+            freed = agent.summarise(msgs, "keep paths")
+        self.assertGreater(freed, 0)
+        self.assertEqual([m["role"] for m in msgs], ["system", "user", "assistant", "user"])
+        self.assertIn("We did the first task.", msgs[1]["content"])
+        self.assertNotIn("hm", msgs[1]["content"])
+        self.assertEqual(msgs[-1]["content"], "second task")
+        self.assertIn("keep paths", REQUESTS[0]["messages"][-1]["content"])
+
+    def test_one_turn_has_nothing_to_summarise(self):
+        msgs = self.convo()[:5]
+        self.assertEqual(agent.summarise(msgs), 0)
+        self.assertEqual(REQUESTS, [])
+
+    def test_an_empty_summary_changes_nothing(self):
+        RESPONSES.append({"role": "assistant", "content": ""})
+        msgs = self.convo()
+        with _patch(agent, "EXTRAS", {}), self.assertRaises(agent.ApiError):
+            agent.summarise(msgs)
+        self.assertEqual(len(msgs), 6)
+
+    def test_slash_compact_summarises(self):
+        RESPONSES.append({"role": "assistant", "content": "summary"})
+        msgs = self.convo()
+        with _patch(agent, "EXTRAS", {}), contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.slash(make_policy(), "/compact", msgs, "sys", [])
+        self.assertIn("summarised", out.getvalue())
+        self.assertEqual(len(msgs), 4)
+
+    def test_a_turn_over_budget_summarises_before_sending(self):
+        RESPONSES.append({"role": "assistant", "content": "summary"})
+        RESPONSES.append({"role": "assistant", "content": "ok"})
+        msgs = self.convo()
+        msgs[1]["content"] = "y" * 3000      # not shrinkable: a user message
+        with _patch(agent, "EXTRAS", {}), _patch(agent, "CONTEXT_CHARS", 2000), \
+                contextlib.redirect_stdout(io.StringIO()):
+            agent.run_turn(make_policy(), msgs, 3)
+        self.assertIn("summary", msgs[1]["content"])
+        self.assertEqual(len(REQUESTS), 2)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

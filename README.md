@@ -395,7 +395,7 @@ setting it empty falls back to the system store alone.
 | `reasoning_split: true` | keeps the chain of thought out of `content`; dropped automatically if the server rejects it |
 | `<minimax:tool_call>` markup in plain text is parsed and executed | some vLLM/SGLang deployments hand the raw markup back instead of parsing it; the turn still works |
 | malformed tool-call JSON is repaired, then reported to the model rather than crashing | |
-| oldest tool results are shrunk, never dropped, when the transcript grows | `tool_call`/`tool` pairs stay intact |
+| oldest tool results are shrunk, never dropped, when the transcript grows; if that is not enough, the earlier turns are summarised by the model | `tool_call`/`tool` pairs stay intact, and the turn in progress is never folded up |
 | `base_resp.status_code` is checked on 200 responses | MiniMax reports auth and quota failures inside a successful HTTP response |
 | retry with backoff on 429/5xx | |
 
@@ -409,7 +409,7 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 /notes           the standing instructions it was given
 /think           /cost            /clear           /quit
 /retry           send the conversation again after a failed request
-/compact         shrink old tool output to make room
+/compact [focus] summarise earlier turns to make room, e.g. /compact keep the API decisions
 /undo            put back the file the agent's last write changed
 /todo            the agent's task list
 

@@ -20,6 +20,7 @@ OpenRouter, OpenAI).
 """
 
 import atexit
+import copy
 import ctypes
 import difflib
 import http.client
@@ -1152,6 +1153,46 @@ def compact(messages: list, budget: int, keep_last: int = 8) -> int:
     return freed
 
 
+SUMMARY_ASK = """\
+The conversation above is about to be replaced by a summary you write now, to
+make room. Write it for yourself, to carry on from. Keep: what the user asked
+for, and every preference or constraint they gave; decisions made and why;
+files read or changed, and what changed; commands that mattered and how they
+came out; what is done and what is still to do. Be specific - paths, names,
+error messages - and brief about everything else. Do not call any tools."""
+
+SUMMARY_HEAD = ("[A summary of the conversation before this point, which you "
+                "wrote to make room]\n\n")
+
+
+def summarise(messages: list, focus: str = "") -> int:
+    """Replace every turn before the newest with a summary the model writes.
+
+    Returns the characters freed, 0 when there is no earlier turn to fold up.
+    The newest turn is kept as it is - it may be the one still running - and
+    the cut falls on a user message, so no tool call is parted from its result.
+    """
+    users = [i for i, m in enumerate(messages) if i and m.get("role") == "user"]
+    if len(users) < 2:
+        return 0
+    cut = users[-1]
+    # What is being folded up may be the very thing that no longer fits, so
+    # the copy sent is shrunk first; the real transcript is only replaced.
+    probe = copy.deepcopy(messages[:cut])
+    compact(probe, CONTEXT_CHARS * 3 // 4, keep_last=0)
+    ask = SUMMARY_ASK + (f"\n\nThe user asks you to focus on: {focus}" if focus else "")
+    reply = llm(probe + [{"role": "user", "content": ask}], tool_schema(), show=False)
+    text = _TC_BLOCK.sub("", split_think(reply.get("content"))[1]).strip()
+    if not text:
+        raise ApiError("the model wrote an empty summary; nothing was changed")
+    before = transcript_size(messages)
+    messages[1:cut] = [
+        {"role": "user", "content": SUMMARY_HEAD + text},
+        {"role": "assistant", "content": "Understood - carrying on from that summary."},
+    ]
+    return before - transcript_size(messages)
+
+
 class Usage:
     def __init__(self):
         self.prompt = self.completion = self.calls = 0
@@ -1629,6 +1670,15 @@ def run_turn(pol, messages: list, max_steps: int) -> None:
     tools = tool_schema()
     for _ in range(max_steps):
         compact(messages, CONTEXT_CHARS)
+        if transcript_size(messages) > CONTEXT_CHARS:
+            # Shrinking old output was not enough: fold the earlier turns up.
+            try:
+                freed = summarise(messages)
+                if freed:
+                    print(dim(f"  (earlier turns summarised to make room: "
+                              f"{freed:,} chars freed)"))
+            except ApiError as e:
+                warn(f"could not summarise to make room: {e}")
         msg = llm(messages, tools)
         if not msg.pop("_shown", False):
             render(msg)
@@ -1687,7 +1737,7 @@ HELP = """  /help            this text
   /undo            put back the file the agent's last write changed
   /cost            tokens used this session
   /retry           send the conversation again after a failed request
-  /compact         shrink old tool output to make room
+  /compact [focus] summarise earlier turns to make room
   /clear           forget the conversation, keep the rules (alias: /reset)
   /quit            leave"""
 
@@ -1753,8 +1803,17 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list,
         else:
             turn(pol, messages, max_steps)
     elif word == "compact":
-        # Half the budget, so it frees something rather than only enough to
-        # get back under a limit the next message would cross again.
+        if sum(1 for m in messages[1:] if m.get("role") == "user") >= 2:
+            try:
+                freed = summarise(messages, rest.strip())
+            except ApiError as e:
+                print(red(f"  ! {e}"))
+            else:
+                print(f"  earlier turns summarised, {freed:,} chars freed")
+            return True
+        # One turn has nothing earlier to fold up; its old output can still
+        # be shrunk.  Half the budget, so it frees something rather than only
+        # enough to get back under a limit the next message would cross again.
         budget = CONTEXT_CHARS // 2
         size = transcript_size(messages)
         if size <= budget:
