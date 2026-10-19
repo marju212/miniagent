@@ -194,20 +194,30 @@ def t_write(path: str, content: str) -> str:
     return f"overwrote {_rel(p)} ({counts(before, content)}, {len(data)} bytes)"
 
 
-def t_edit(path: str, old: str, new: str) -> str:
+def _truthy(v) -> bool:
+    """A boolean argument, as a model may spell one."""
+    return v is True or str(v).strip().lower() in ("true", "1", "yes")
+
+
+def t_edit(path: str, old: str, new: str, replace_all=False) -> str:
     p = resolve(path)
     text = p.read_text(encoding="utf-8")
+    every = _truthy(replace_all)
+    if every and not old:
+        return "ERROR: replace_all needs a non-empty old string"
     n = text.count(old)
     if n == 0:
         return "ERROR: the old string does not appear in the file"
-    if n > 1:
-        return f"ERROR: the old string matches {n} places, make it unique"
+    if n > 1 and not every:
+        return (f"ERROR: the old string matches {n} places; include more "
+                f"surrounding lines to make it unique, or set replace_all")
     updated = text.replace(old, new)
     cap = int(LIMITS.get("max_write_bytes", 1_000_000))
     if len(updated.encode("utf-8")) > cap:
         return f"ERROR: the result exceeds the policy limit of {cap} bytes"
     p.write_text(updated, encoding="utf-8")
-    return f"edited {_rel(p)} ({counts(text, updated)})"
+    places = f", {n} places" if n > 1 else ""
+    return f"edited {_rel(p)} ({counts(text, updated)}{places})"
 
 
 def bash_argv(cmd: str) -> list:
@@ -299,10 +309,11 @@ TOOLS = {
         "path": {"type": "string", "description": "Path relative to the working directory."},
         "content": {"type": "string", "description": "The complete new content of the file."},
     }, ["path", "content"]),
-    "edit_file": (t_edit, "Replace exactly one unique string in a file. Prefer this over rewriting.", {
+    "edit_file": (t_edit, "Replace a unique string in a file. Prefer this over rewriting.", {
         "path": {"type": "string", "description": "Path relative to the working directory."},
-        "old": {"type": "string", "description": "Text to replace. Must appear exactly once."},
+        "old": {"type": "string", "description": "Text to replace. Must appear exactly once, unless replace_all is set."},
         "new": {"type": "string", "description": "Text to put in its place."},
+        "replace_all": {"type": "boolean", "description": "Replace every occurrence, e.g. to rename something. Default false."},
     }, ["path", "old", "new"]),
     "bash": (t_bash, "Run a shell command in the working directory. Use it for ls, grep, find, git and tests.", {
         "cmd": {"type": "string", "description": "The command line to run."},
@@ -680,6 +691,8 @@ def proposed_change(tool: str, args: dict):
             return _rel(p), before, str(args.get("content") or "")
         old = str(args.get("old") or "")
         n = before.count(old)
+        if n > 1 and old and _truthy(args.get("replace_all")):
+            return _rel(p), before, before.replace(old, str(args.get("new") or ""))
         if n != 1:
             # Worth saying out loud: the call is going to fail for this reason.
             print(dim(f"  (no preview: the old string matches {n} places)"))

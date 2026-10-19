@@ -2665,6 +2665,26 @@ class Wrapper(unittest.TestCase):
         r = run_wrapper("--rules", str(self.proj), home=self.home)
         self.assertIn("readable by others", r.stderr)
 
+# ---------------------------------------------------------------- edits
+class Edits(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        agent.ROOTS[:] = [self.root]
+        self.f = self.root / "a.py"
+        self.f.write_text("foo = 1\nprint(foo)\n")
+
+    def test_replace_all(self):
+        self.assertIn("matches 2", agent.t_edit("a.py", "foo", "bar"))
+        out = agent.t_edit("a.py", "foo", "bar", replace_all=True)
+        self.assertIn("2 places", out)
+        self.assertEqual(self.f.read_text(), "bar = 1\nprint(bar)\n")
+
+    def test_replace_all_previews_the_whole_change(self):
+        _, before, after = agent.proposed_change(
+            "edit_file", {"path": "a.py", "old": "foo", "new": "bar", "replace_all": True})
+        self.assertEqual(after.count("bar"), 2)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

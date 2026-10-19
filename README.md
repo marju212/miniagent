@@ -413,6 +413,9 @@ agent --check bash 'git push'    # explain one decision
 `read_file`, `write_file`, `edit_file`, `bash` — all confined to the working
 directory (plus anything in `allowed_roots`), all gated by the policy.
 
+`edit_file` replaces one unique string, or every occurrence with
+`replace_all`, for a rename.
+
 `bash` runs a login shell, so whatever sets up your `PATH` — nvm, pyenv, a
 devcontainer profile — is in effect. Profile scripts are allowed to `cd` and
 some do, so the working directory is asserted again after they have run: a
