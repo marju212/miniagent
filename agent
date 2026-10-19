@@ -173,34 +173,11 @@ fresh_env() {                           # fresh_env URL_LINE MODEL_LINE KEY_LINE
     cat <<'EOF'
 # miniagent settings.  Sourced by the `agent` wrapper as shell, so command
 # substitution works.  Anything already set in your shell wins over what is
-# here.  Keep it private - it holds your API key.
+# here.  Keep it private - it holds your API key.  Every other setting has a
+# default (sampling follows AGENT_MODEL); the README lists them, to add here.
 
 EOF
     printf '%s\n%s\n%s\n' "$1" "$2" "$3"
-    cat <<'EOF'
-
-# A key out of a password manager works too:
-# export AGENT_API_KEY=$(pass show minimax/api)
-
-# Sampling follows AGENT_MODEL: MiniMax, Qwen3.8 and Qwen3-Coder each get the
-# settings their makers publish, and the banner says which it picked.  Set one
-# here only to override it - whatever is set wins over the profile.
-# export AGENT_TEMPERATURE=1.0
-# export AGENT_TOP_P=0.95
-# export AGENT_TOP_K=40
-# export AGENT_REPETITION_PENALTY=1.05
-# export AGENT_MAX_TOKENS=16384
-# export AGENT_CONTEXT_CHARS=480000
-
-# The CA bundles that verify the endpoint's certificate, tried in order and
-# loaded on top of the system trust store.  Set it if you get
-# "certificate verify failed"; set it empty to use the system store alone.
-# export AGENT_CA_CERTS=/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt
-
-# export AGENT_THINKING=1     # show the model's reasoning
-# export AGENT_YOLO=1         # auto-approve every `ask` (a `deny` still holds)
-# export AGENT_POLICY=        # an extra rule file for every run
-EOF
 }
 
 

@@ -2550,11 +2550,12 @@ class Wrapper(unittest.TestCase):
         r = run_wrapper("--env", home=self.home)
         self.assertEqual(r.stdout.strip(), str(self.env_file))
 
-    def test_the_settings_file_leaves_sampling_to_the_model_profile(self):
+    def test_a_new_settings_file_holds_only_endpoint_model_and_key(self):
         run_wrapper("--init", home=self.home, env={"AGENT_MODEL": "Qwen3-Coder-30B"})
         text = self.env_file.read_text(encoding="utf-8")
-        self.assertNotRegex(text, r"(?m)^export AGENT_(TOP_K|TEMPERATURE)")
-        self.assertIn("# export AGENT_TOP_K=", text)
+        settings = re.findall(r"(?m)^export (\w+)=", text)
+        self.assertEqual(settings, ["AGENT_BASE_URL", "AGENT_MODEL", "AGENT_API_KEY"])
+        self.assertNotIn("# export", text)
 
     def test_init_writes_a_private_file_and_can_be_run_again(self):
         # a second --init is how you change the model when a new one lands, so
