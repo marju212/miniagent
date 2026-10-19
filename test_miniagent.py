@@ -2665,6 +2665,69 @@ class Wrapper(unittest.TestCase):
         r = run_wrapper("--rules", str(self.proj), home=self.home)
         self.assertIn("readable by others", r.stderr)
 
+# ---------------------------------------------------------------- search tools
+class Search(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        (self.root / "src").mkdir()
+        (self.root / "src" / "app.py").write_text("def main():\n    return TOKEN\n")
+        (self.root / "src" / "util.py").write_text("x = 1\n")
+        (self.root / "README.md").write_text("TOKEN lives in src\n")
+        (self.root / ".env").write_text("TOKEN=hunter2\n")
+        (self.root / "node_modules").mkdir()
+        (self.root / "node_modules" / "dep.js").write_text("TOKEN\n")
+        agent.ROOTS[:] = [self.root]
+        self.saved = agent.POLICY
+        agent.POLICY = make_policy()
+
+    def tearDown(self):
+        agent.POLICY = self.saved
+
+    def test_grep_finds_lines_with_their_paths(self):
+        out = agent.t_grep("TOKEN")
+        self.assertIn("src/app.py:2: return TOKEN", out)
+        self.assertIn("README.md:1:", out)
+
+    def test_grep_does_not_read_what_read_file_is_denied(self):
+        out = agent.t_grep("hunter2")
+        self.assertNotIn(".env", out)
+        self.assertIn("skipped", out)
+
+    def test_grep_skips_dependency_directories(self):
+        self.assertNotIn("node_modules", agent.t_grep("TOKEN"))
+
+    def test_grep_include_and_case(self):
+        out = agent.t_grep("token", include="*.py", ignore_case=True)
+        self.assertIn("src/app.py", out)
+        self.assertNotIn("README", out)
+
+    def test_grep_reports_a_bad_regex(self):
+        self.assertTrue(agent.t_grep("(").startswith("ERROR"))
+
+    def test_grep_cannot_leave_the_sandbox(self):
+        with self.assertRaises(ValueError):
+            agent.t_grep("x", path="/etc")
+
+    def test_glob_matches_at_any_depth_unless_anchored(self):
+        self.assertEqual(set(agent.t_glob("*.py").splitlines()[1:]),
+                         {"src/app.py", "src/util.py"})
+        self.assertIn("no files", agent.t_glob("*.rs"))
+        self.assertEqual(agent.t_glob("src/app.py").splitlines()[1:], ["src/app.py"])
+
+    def test_glob_does_not_list_denied_files(self):
+        self.assertNotIn(".env", agent.t_glob(".*"))
+
+    def test_search_tools_are_allowed_by_default(self):
+        pol = make_policy()
+        self.assertEqual(pol.check("grep", {"path": "."}).action, "allow")
+        self.assertEqual(pol.check("glob", {"path": "src"}).action, "allow")
+
+    def test_a_search_without_a_path_is_judged_as_the_working_directory(self):
+        pol = make_policy(allow=["grep(.)"])
+        result, _ = agent.call_tool(pol, "grep", {"pattern": "TOKEN"})
+        self.assertIn("src/app.py", result)
+
+
 # ---------------------------------------------------------------- edits
 class Edits(unittest.TestCase):
     def setUp(self):

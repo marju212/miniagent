@@ -124,6 +124,7 @@ if MINIMAX:
 # Filled in once the policy is loaded; the defaults keep the module importable.
 LIMITS = dict(pol_mod.DEFAULTS["limits"])
 ROOTS: list = []
+POLICY = None       # the search tools ask it which files they may read
 
 
 # ---------------------------------------------------------------- sandbox
@@ -147,7 +148,7 @@ def _rel(p: Path) -> str:
 def t_read(path: str, offset: int = 0, limit: int = 2000) -> str:
     p = resolve(path)
     if p.is_dir():
-        return "ERROR: that is a directory; use bash with ls"
+        return "ERROR: that is a directory; use glob to list it"
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     offset = max(0, int(offset))
     chunk = lines[offset:offset + max(1, int(limit))]
@@ -262,6 +263,118 @@ def t_edit(path: str, old: str, new: str, replace_all=False) -> str:
     return f"edited {_rel(p)} ({counts(text, updated)}{places})"
 
 
+# ---------------------------------------------------------------- search
+def _n(count: int, word: str, plural: str = "") -> str:
+    return f"{count} {word if count == 1 else plural or word + 's'}"
+
+
+# Never descended into while searching - asked for by name, they still are.
+SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv",
+             "venv", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox"}
+SEARCH_FILE_MAX = 2_000_000
+
+
+def _walk(base: Path):
+    """Every file under `base`, in a stable order."""
+    if base.is_file():
+        yield base
+        return
+    for top, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for f in sorted(files):
+            yield Path(top) / f
+
+
+def _may_read(p: Path, quietly: bool) -> bool:
+    """Would read_file get this file without anyone being asked?
+
+    The search tools open files on the model's behalf, so they answer to the
+    read_file rules file by file: grep over `**` must not be a way to read the
+    `.env` that read_file is denied.  `quietly` is the bar for reading a
+    file's contents; listing its name only has to stay clear of a deny.
+    """
+    try:
+        resolve(str(p))         # a symlink out of the sandbox is not followed
+    except ValueError:
+        return False
+    if POLICY is None:
+        return True
+    action = POLICY.check("read_file", {"path": _rel(p)}).action
+    return action == "allow" if quietly else action != "deny"
+
+
+def _selector(pattern: str):
+    """A path matcher: `*.py` matches at any depth, `src/*.py` is anchored."""
+    if not pattern:
+        return None
+    g = pol_mod.Glob(pattern, True)
+    if "/" in pattern:
+        return g.match
+    return lambda rel: g.match(rel.rsplit("/", 1)[-1])
+
+
+def t_glob(pattern: str, path: str = ".", limit: int = 500) -> str:
+    base = resolve(path)
+    match = _selector(pattern)
+    found = []
+    for f in _walk(base):
+        rel = f.relative_to(base).as_posix() if f != base else f.name
+        if match(rel) and _may_read(f, quietly=False):
+            found.append(f)
+    if not found:
+        return f"no files match {pattern}"
+    # Newest first: what was touched last is usually what the task is about.
+    found.sort(key=lambda f: f.stat().st_mtime if f.exists() else 0, reverse=True)
+    cap = max(1, int(limit))
+    head = _n(len(found), "file") + (f", newest {cap} shown" if len(found) > cap else "")
+    return head + "\n" + "\n".join(_rel(f) for f in found[:cap])
+
+
+def t_grep(pattern: str, path: str = ".", include: str = "",
+           ignore_case=False, limit: int = 200) -> str:
+    try:
+        rx = re.compile(pattern, re.I if _truthy(ignore_case) else 0)
+    except re.error as e:
+        return f"ERROR: not a valid regular expression: {e}"
+    base = resolve(path)
+    match = _selector(include)
+    cap = max(1, int(limit))
+    hits, files, skipped, full = [], 0, 0, False
+    for f in _walk(base):
+        rel = f.relative_to(base).as_posix() if f != base else f.name
+        if match and not match(rel):
+            continue
+        if not _may_read(f, quietly=True):
+            skipped += 1
+            continue
+        try:
+            if f.stat().st_size > SEARCH_FILE_MAX:
+                continue
+            data = f.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data[:8192]:
+            continue                # binary
+        seen = False
+        for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+            if rx.search(line):
+                hits.append(f"{_rel(f)}:{n}: {_short(line.strip(), 300)}")
+                seen = True
+                if len(hits) >= cap:
+                    full = True
+                    break
+        files += seen
+        if full:
+            break
+    why = (f"; {_n(skipped, 'file')} skipped, since read_file may not read "
+           f"them unasked" if skipped else "")
+    if not hits:
+        return f"no matches for {pattern}{why}"
+    stop = f", stopped at {cap}" if full else ""
+    return (f"{_n(len(hits), 'match', 'matches')} in "
+            f"{_n(files, 'file')}{stop}{why}\n" + "\n".join(hits))
+
+
 def bash_argv(cmd: str) -> list:
     """A login shell, so whatever sets up the user's PATH - nvm, pyenv, a
     devcontainer profile - is in effect. Profile scripts are allowed to `cd`
@@ -357,11 +470,26 @@ TOOLS = {
         "new": {"type": "string", "description": "Text to put in its place."},
         "replace_all": {"type": "boolean", "description": "Replace every occurrence, e.g. to rename something. Default false."},
     }, ["path", "old", "new"]),
-    "bash": (t_bash, "Run a shell command in the working directory. Use it for ls, grep, find, git and tests.", {
+    "grep": (t_grep, "Search file contents with a regular expression. Returns path:line: text. Use this rather than grep in bash.", {
+        "pattern": {"type": "string", "description": "A Python regular expression."},
+        "path": {"type": "string", "description": "File or directory to search. Default the working directory."},
+        "include": {"type": "string", "description": "Only files matching this glob, e.g. *.py or src/**/*.ts."},
+        "ignore_case": {"type": "boolean", "description": "Match case-insensitively."},
+        "limit": {"type": "integer", "description": "Stop after this many matches. Default 200."},
+    }, ["pattern"]),
+    "glob": (t_glob, "Find files by name, newest first. `*.py` matches at any depth; `src/*.py` is anchored; ** crosses directories.", {
+        "pattern": {"type": "string", "description": "The glob to match."},
+        "path": {"type": "string", "description": "Directory to search. Default the working directory."},
+        "limit": {"type": "integer", "description": "At most this many paths. Default 500."},
+    }, ["pattern"]),
+    "bash": (t_bash, "Run a shell command in the working directory: tests, builds, git. Use grep, glob and read_file to look around.", {
         "cmd": {"type": "string", "description": "The command line to run."},
         "timeout": {"type": "integer", "description": "Seconds to wait. Default 120."},
     }, ["cmd"]),
 }
+
+# The tools that search from the working directory when given no path.
+SEARCHES = ("grep", "glob")
 
 
 def tool_schema() -> list:
@@ -813,6 +941,9 @@ def call_tool(pol, name: str, args: dict) -> tuple:
     """
     if name not in TOOLS:
         return f"ERROR: unknown tool {name}. Available: {', '.join(TOOLS)}", 0.0
+    if name in SEARCHES and not args.get("path"):
+        # Judged as what it will search, not as an empty path.
+        args = {**args, "path": "."}
     d = pol.check(name, args)
     if d.action == "deny":
         return (f"DENIED by policy: {d.reason}"
@@ -1263,7 +1394,8 @@ def system_prompt(root: Path, pol) -> str:
 
 Work in small steps: read before you write, make focused changes, then verify
 with a command. All paths are relative to the working directory. Prefer
-edit_file over rewriting a whole file. Run several independent tool calls in
+edit_file over rewriting a whole file. Find things with grep and glob rather
+than through bash. Run several independent tool calls in
 one turn instead of one at a time. Keep your messages to the user short - do
 the actual work with tools, and stop when the task is done rather than
 narrating what you might do next.
@@ -1516,8 +1648,10 @@ def _terminate(sig, _frame):
 
 def setup(root: Path):
     pol = pol_mod.load(root, prompt=trust_prompt)
+    global POLICY
     LIMITS.update(pol.limits)
     ROOTS[:] = pol.roots(root)
+    POLICY = pol
     return pol
 
 

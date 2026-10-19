@@ -57,6 +57,8 @@ SUBJECT = {
     "read_file": "path",
     "write_file": "path",
     "edit_file": "path",
+    "grep": "path",
+    "glob": "path",
     "bash": "cmd",
 }
 
@@ -120,6 +122,9 @@ DEFAULTS = {
     ],
     "allow": [
         "read_file(**)",
+        # The search tools read each file through the read_file rules, so a
+        # file read_file may not touch unasked is skipped rather than searched.
+        "grep(**)", "glob(**)",
         "bash(ls*)", "bash(cat *)", "bash(head *)", "bash(tail *)",
         "bash(wc *)", "bash(file *)", "bash(pwd*)", "bash(echo *)",
         "bash(grep *)", "bash(rg *)", "bash(find *)", "bash(which *)",

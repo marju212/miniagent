@@ -420,11 +420,21 @@ agent --check bash 'git push'    # explain one decision
 
 ## Tools
 
-`read_file`, `write_file`, `edit_file`, `bash` — all confined to the working
-directory (plus anything in `allowed_roots`), all gated by the policy.
+`read_file`, `write_file`, `edit_file`, `grep`, `glob`, `bash` — all
+confined to the working directory (plus anything in `allowed_roots`), all
+gated by the policy.
 
 `edit_file` replaces one unique string, or every occurrence with
 `replace_all`, for a rename.
+
+`grep` (a regular expression over file contents) and `glob` (file names,
+newest first; `*.py` matches at any depth, `src/*.py` is anchored) are allowed
+by default, and the model is told to use them rather than `grep` and `find`
+in `bash`. They are judged on the directory they search, and then each file
+they open is put to the `read_file` rules: a file that `read_file` could not
+read without asking is skipped, and the result says how many were. So
+`grep(**)` cannot read the `.env` that `read_file(**/.env)` denies. `.git`,
+`node_modules`, virtualenvs and caches are not descended into.
 
 `bash` runs a login shell, so whatever sets up your `PATH` — nvm, pyenv, a
 devcontainer profile — is in effect. Profile scripts are allowed to `cd` and

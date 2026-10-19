@@ -347,6 +347,12 @@ def diff_lines(before: str, after: str, max_lines: int = 24) -> list:
 def tool_line(name: str, args: dict, subject_key: str = "") -> str:
     """`bash(pytest -q)` - the same shape the permission prompt and /policy
     use, so the three agree on how a call is named."""
+    if name in ("grep", "glob"):
+        # The pattern is what the call is about; the path is where.
+        where = str(args.get("path") or "")
+        what = str(args.get("pattern") or "")
+        subject = what + (f" in {where}" if where and where != "." else "")
+        return dim(f"  · {name}({_short(subject, 120)})")
     subject = str(args.get(subject_key, "") or "") if subject_key else ""
     if subject and name == "read_file":
         span = args.get("offset")
@@ -419,5 +425,6 @@ def tool_result(name: str, result: str, seconds: float = 0.0,
         cut = " (clipped)" if _CUT_OUT in result else ""
         return ["    " + dim(_fit(f"{n} lines{cut}{more}{took}", room))]
 
-    # write_file / edit_file already say +N -M themselves
+    # write_file / edit_file already say +N -M themselves; grep and glob
+    # lead with a count
     return ["    " + dim(_fit(result.splitlines()[0], room) + took)]
