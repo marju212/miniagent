@@ -2670,6 +2670,7 @@ class Edits(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()).resolve()
         agent.ROOTS[:] = [self.root]
+        agent.UNDO.clear()
         self.f = self.root / "a.py"
         self.f.write_text("foo = 1\nprint(foo)\n")
 
@@ -2683,6 +2684,29 @@ class Edits(unittest.TestCase):
         _, before, after = agent.proposed_change(
             "edit_file", {"path": "a.py", "old": "foo", "new": "bar", "replace_all": True})
         self.assertEqual(after.count("bar"), 2)
+
+    def test_undo_reverses_writes_newest_first(self):
+        agent.t_edit("a.py", "= 1", "= 2")
+        agent.t_write("new.txt", "hello")
+        self.assertIn("removed new.txt", agent.undo_last())
+        self.assertFalse((self.root / "new.txt").exists())
+        self.assertIn("restored a.py", agent.undo_last())
+        self.assertEqual(self.f.read_text(), "foo = 1\nprint(foo)\n")
+        self.assertIn("nothing to undo", agent.undo_last())
+
+    def test_undo_leaves_a_file_someone_changed_since(self):
+        agent.t_edit("a.py", "= 1", "= 2")
+        self.f.write_text("mine now\n")
+        self.assertIn("left a.py alone", agent.undo_last())
+        self.assertEqual(self.f.read_text(), "mine now\n")
+
+    def test_slash_undo_tells_the_model(self):
+        agent.t_edit("a.py", "= 1", "= 2")
+        mine = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.slash(make_policy(), "/undo", [{"role": "system"}], "s", mine)
+        self.assertEqual(len(mine), 1)
+        self.assertIn("restored a.py", mine[0])
 
 
 

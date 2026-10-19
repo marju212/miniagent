@@ -74,6 +74,15 @@ Every call says what it did: the exit status and the ends of the output for a
 command, `+N -M` for an edit. `AGENT_RESULT_LINES` sets how much is shown,
 default 6; `0` goes back to naming the call and nothing else.
 
+### Taking a change back
+
+`/undo` puts back the file the agent's last `write_file` or `edit_file`
+changed — or removes it, if the agent created it — and tells the model, so it
+does not go on believing its change is still there. Run it again to go further
+back. It only restores a file that still holds what the agent wrote: if you or
+a command have changed it since, it is left alone and you are told. Changes
+made through `bash` are not covered; that is what git is for.
+
 A grey bar is pinned to the bottom row: where the agent is working, the branch,
 and a `*` if the tree is dirty — all of which can change under you when the
 agent runs `git checkout`. It stays put while tools run, since that is when you
@@ -396,6 +405,7 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 /think           /cost            /clear           /quit
 /retry           send the conversation again after a failed request
 /compact         shrink old tool output to make room
+/undo            put back the file the agent's last write changed
 
 !cmd             run a command yourself; ! alone opens a shell
 up arrow         an earlier prompt; ctrl-r searches them

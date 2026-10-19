@@ -170,6 +170,40 @@ def counts(before: str, after: str) -> str:
     return f"+{plus} -{minus}"
 
 
+# Every write the agent made this session, oldest first, so /undo can put a
+# file back.  Only its own writes: what a bash command changed is not here.
+UNDO: list = []             # (path, bytes before or None if new, bytes after)
+UNDO_MAX = 50
+
+
+def _remember(p: Path, before, after: bytes) -> None:
+    UNDO.append((p, before, after))
+    del UNDO[:-UNDO_MAX]
+
+
+def undo_last() -> str:
+    """Put back the file the agent's newest write changed.
+
+    Only if it still holds what the agent wrote: anything else means someone
+    has been at it since, and restoring would throw their change away.
+    """
+    if not UNDO:
+        return "nothing to undo - only the agent's own writes and edits can be"
+    p, before, after = UNDO.pop()
+    try:
+        now = p.read_bytes() if p.exists() else None
+    except OSError as e:
+        return f"left {_rel(p)} alone: {e}"
+    if now != after:
+        return f"left {_rel(p)} alone: it has changed since the agent wrote it"
+    if before is None:
+        p.unlink()
+        return f"removed {_rel(p)}, which the agent had created"
+    p.write_bytes(before)
+    back = counts(after.decode("utf-8", "replace"), before.decode("utf-8", "replace"))
+    return f"restored {_rel(p)} ({back})"
+
+
 def t_write(path: str, content: str) -> str:
     p = resolve(path)
     data = content.encode("utf-8")
@@ -177,15 +211,21 @@ def t_write(path: str, content: str) -> str:
     if len(data) > cap:
         return f"ERROR: {len(data)} bytes exceeds the policy limit of {cap}"
     existed = p.exists()
-    before, comparable = "", False
+    before, comparable, raw = "", False, None
     if existed:
         try:
-            before = p.read_text(encoding="utf-8")
-            comparable = True
+            # Sized first, like the preview: a file too big to keep a copy
+            # of simply cannot be undone, and /undo will say so.
+            if p.is_file() and p.stat().st_size <= cap:
+                raw = p.read_bytes()
+                before = raw.decode("utf-8")
+                comparable = True
         except (OSError, UnicodeDecodeError):
             comparable = False      # binary or unreadable: do not guess at +/-
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
+    if not existed or raw is not None:
+        _remember(p, raw, data)
     if not existed:
         return (f"wrote {_rel(p)} (new file, "
                 f"{len(content.splitlines())} lines, {len(data)} bytes)")
@@ -213,9 +253,11 @@ def t_edit(path: str, old: str, new: str, replace_all=False) -> str:
                 f"surrounding lines to make it unique, or set replace_all")
     updated = text.replace(old, new)
     cap = int(LIMITS.get("max_write_bytes", 1_000_000))
-    if len(updated.encode("utf-8")) > cap:
+    data = updated.encode("utf-8")
+    if len(data) > cap:
         return f"ERROR: the result exceeds the policy limit of {cap} bytes"
-    p.write_text(updated, encoding="utf-8")
+    p.write_bytes(data)
+    _remember(p, text.encode("utf-8"), data)
     places = f", {n} places" if n > 1 else ""
     return f"edited {_rel(p)} ({counts(text, updated)}{places})"
 
@@ -1331,6 +1373,7 @@ HELP = """  /help            this text
   up arrow         an earlier prompt; ctrl-r searches them
   alt-enter        insert a newline; enter sends the whole message
   paste            several lines show as [Pasted text #1 +N lines]
+  /undo            put back the file the agent's last write changed
   /cost            tokens used this session
   /retry           send the conversation again after a failed request
   /compact         shrink old tool output to make room
@@ -1413,6 +1456,12 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list,
             freed = compact(messages, budget)
             print(f"  freed {freed:,} chars" if freed
                   else "  nothing left to shrink; /clear starts fresh")
+    elif word == "undo":
+        said = undo_last()
+        print(f"  {said}")
+        if said.startswith(("restored", "removed")):
+            # The model believes its change is still there; tell it otherwise.
+            mine.append(f"/undo - {said}")
     elif word in ("reset", "clear"):
         del messages[1:]
         messages[0] = {"role": "system", "content": system}
