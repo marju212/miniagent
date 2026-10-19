@@ -1,7 +1,8 @@
 # miniagent
 
-A Claude Code-shaped coding agent, tuned for **MiniMax-M2.5**. Python 3.9+,
-standard library only, no dependencies.
+A Claude Code-shaped coding agent, tuned for **MiniMax-M2.5**, with the
+published settings for **Qwen3.8** and **Qwen3-Coder** picked by model name.
+Python 3.9+, standard library only, no dependencies.
 
 Everything the agent may do comes out of a JSON rule file — the global one is
 `~/.miniagent/policy.json`. Nothing is baked into the loop: every tool call is
@@ -30,7 +31,8 @@ there is no key yet.
 
 `agent --uninstall` is the way back out: it takes the symlink off your PATH,
 then lists what `~/.miniagent` still holds — your key, your global rules, the
-projects you have vouched for, your prompt history — and asks once before
+projects you have vouched for, your prompt history, your saved sessions — and
+asks once before
 removing that too. Enter keeps it, so a re-install finds everything where it
 was. It never touches an `agent` on your PATH that is not a link to this
 checkout, it leaves the `PATH` line in your rc file for you to remove, and off
@@ -80,6 +82,15 @@ Every call says what it did: the exit status and the ends of the output for a
 command, `+N -M` for an edit. `AGENT_RESULT_LINES` sets how much is shown,
 default 6; `0` goes back to naming the call and nothing else.
 
+A grey bar is pinned to the bottom row: where the agent is working, the branch,
+and a `*` if the tree is dirty — all of which can change under you when the
+agent runs `git checkout`. It stays put while tools run, since that is when you
+most want to see it. Resizing the window re-cuts the room it reserves, and
+anything that kills the agent — including `ctrl-\` — hands the row back before
+it goes, so the shell you land in afterwards scrolls normally.
+`AGENT_STATUS=off` turns it off, and it never appears when the output is not a
+terminal.
+
 ### Picking up where you left off
 
 Every conversation is saved after each turn, to
@@ -99,15 +110,6 @@ does not go on believing its change is still there. Run it again to go further
 back. It only restores a file that still holds what the agent wrote: if you or
 a command have changed it since, it is left alone and you are told. Changes
 made through `bash` are not covered; that is what git is for.
-
-A grey bar is pinned to the bottom row: where the agent is working, the branch,
-and a `*` if the tree is dirty — all of which can change under you when the
-agent runs `git checkout`. It stays put while tools run, since that is when you
-most want to see it. Resizing the window re-cuts the room it reserves, and
-anything that kills the agent — including `ctrl-\` — hands the row back before
-it goes, so the shell you land in afterwards scrolls normally.
-`AGENT_STATUS=off` turns it off, and it never appears when the output is not a
-terminal.
 
 ### Running something yourself
 
@@ -348,8 +350,9 @@ A write shows what it would do before you answer, so `y` is not a guess:
 Nothing is written to work the diff out, and nothing large is read to work out
 that it is too large. A binary file, a file over the write limit, a path
 outside the working directory, or an `old` string that matches more than once
-shows no preview — the last of those says so, since it is also why the call is
-about to fail. `AGENT_DIFF_LINES` caps the length, default 24; `0` turns it off.
+without `replace_all` shows no preview — the last of those says so, since it is
+also why the call is about to fail. With `replace_all` every place it changes
+is shown. `AGENT_DIFF_LINES` caps the length, default 24; `0` turns it off.
 
 A `confirm` looks different: there is nothing to press but yes or no, and it
 shows the **whole** command line rather than the part that matched, untruncated
@@ -369,7 +372,7 @@ model is told so, and told not to route around it. You are shown the refusal
 and, once per command, the one route that is left:
 
 ```
-  · bash({"cmd": "sudo apt install libpq-dev"})
+  · bash(sudo apt install libpq-dev)
     DENIED by policy: matched deny rule (rule: bash(sudo *))
     to run it as yourself, outside the policy:  !sudo apt install libpq-dev
 ```
@@ -385,7 +388,7 @@ refuses this call and lets the agent carry on with the rest of the task.
 `ctrl-c` does what escape does.
 
 ```
-  · write_file({"path": "src/db.py", ...})
+  · write_file(src/db.py)
 
 [stopped - what would you like to do instead?]
 
@@ -427,6 +430,11 @@ An entry that does not exist is skipped, a directory is read as one, and
 setting it empty falls back to the system store alone.
 
 ## Tuned for MiniMax-M2.5
+
+How the agent meets MiniMax's quirks. Only the first row and `reasoning_split`
+are MiniMax's alone — other models get their own sampling, see
+[Sampling follows the model](#sampling-follows-the-model); the rest applies to
+whatever model is behind the endpoint.
 
 | what | why |
 |------|-----|
@@ -521,6 +529,9 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_REPETITION_PENALTY` | per model; `0` sends none |
 | `AGENT_MAX_TOKENS` | per model |
 | `AGENT_CONTEXT_CHARS` | per model |
+| `AGENT_REASONING` | unset; sent as `reasoning_effort` to servers that take it |
+| `AGENT_TIMEOUT` | `900` seconds to wait for a reply |
+| `AGENT_RETRIES` | `5` tries before a failed request is reported |
 | `AGENT_MAX_STEPS` | policy `max_steps`; may only lower it |
 | `AGENT_POLICY` | an extra rule file for one run |
 | `AGENT_CA_CERTS` | `/etc/ssl/cert.pem:/etc/ssl/certs/ca_bundle.crt` |
