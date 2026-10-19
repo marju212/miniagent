@@ -46,6 +46,7 @@ settings first.
 ```bash
 agent ~/code/my-project                            # interactive session
 agent -p "fix the failing test" ~/code/my-project  # one shot, then exit
+agent -c ~/code/my-project                         # carry on where you left off
 agent                                                  # the current directory
 ```
 
@@ -78,6 +79,17 @@ that from the start.
 Every call says what it did: the exit status and the ends of the output for a
 command, `+N -M` for an edit. `AGENT_RESULT_LINES` sets how much is shown,
 default 6; `0` goes back to naming the call and nothing else.
+
+### Picking up where you left off
+
+Every conversation is saved after each turn, to
+`~/.miniagent/sessions/` (`0600`, since it holds whatever the agent read), one
+folder per working directory. `agent -c` carries on with the newest one for
+the directory you are in; `/resume` lists the others and `/resume 2` opens one.
+The system prompt is not saved but rebuilt, so a resumed session runs under
+the rules and instructions in force now. `/clear` starts a new file and leaves
+the old one for `/resume`. The newest `AGENT_SESSIONS` (default 50) are kept
+per directory; `0` saves nothing.
 
 ### Taking a change back
 
@@ -149,6 +161,7 @@ wraps across rows, and history keeps the full text of every message.
 | `~/.miniagent/miniagent.md` | standing instructions for every project |
 | `~/.miniagent/trusted.json` | project rule files you have vouched for |
 | `~/.miniagent/history` | what you have typed at the prompt |
+| `~/.miniagent/sessions/` | saved conversations, for `agent -c` and `/resume` |
 | `<project>/.miniagent.md` | instructions for one project |
 | `<project>/.miniagent/policy.json` | rules for one project |
 
@@ -410,6 +423,7 @@ Thinking is hidden by default; `AGENT_THINKING=1` or `/think` shows it.
 /think           /cost            /clear           /quit
 /retry           send the conversation again after a failed request
 /compact [focus] summarise earlier turns to make room, e.g. /compact keep the API decisions
+/resume [N]      list the saved sessions here, or carry on with one
 /undo            put back the file the agent's last write changed
 /todo            the agent's task list
 
@@ -489,6 +503,7 @@ allows or excuse working around a refusal. `/notes` shows what is loaded.
 | `AGENT_DIFF_LINES` | `24` lines of diff at a permission prompt; `0` hides it |
 | `AGENT_RESULT_LINES` | `6` lines of tool output; `0` hides it |
 | `AGENT_STREAM` | on; `0` waits for the whole reply |
+| `AGENT_SESSIONS` | `50` saved sessions kept per directory; `0` saves none |
 
 ## Tests
 

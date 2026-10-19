@@ -9,6 +9,7 @@ put to the policy first and comes back allow / ask / confirm / deny.
     export AGENT_API_KEY=...                    # or MINIMAX_API_KEY
     python3 agent.py ~/code/my-project          # interactive
     python3 agent.py -p "fix the failing test"  # one shot, then exit
+    python3 agent.py -c                         # carry on with the last session here
 
     python3 agent.py --init-policy              # write the global rule file
     python3 agent.py --rules                    # show the rules in force
@@ -23,6 +24,7 @@ import atexit
 import copy
 import ctypes
 import difflib
+import hashlib
 import http.client
 import json
 import os
@@ -105,9 +107,11 @@ STREAM = os.environ.get("AGENT_STREAM", "1") != "0"
 MINIMAX = "minimax" in (MODEL + BASE_URL).lower()
 GLOBAL_POLICY = Path.home() / ".miniagent" / "policy.json"
 HISTORY = Path.home() / ".miniagent" / "history"
+SESSIONS = Path.home() / ".miniagent" / "sessions"
 # Read here rather than where they are used, so a bad value reaches BAD_ENV
 # before main() reports it.
 HISTORY_LINES = _env("AGENT_HISTORY", 1000, int)
+SESSIONS_KEPT = _env("AGENT_SESSIONS", 50, int)
 MAX_STEPS_ENV = _env("AGENT_MAX_STEPS", 10**9, int)
 PROMPT = _env("AGENT_PROMPT", "agent> ")
 RETRY_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -1193,6 +1197,104 @@ def summarise(messages: list, focus: str = "") -> int:
     return before - transcript_size(messages)
 
 
+# ---------------------------------------------------------------- sessions
+# Each conversation is saved after every turn, so a closed terminal or a
+# crash does not take it with it.  One directory per working directory:
+# `agent -c` carries on with the newest one, `/resume` picks any.
+SESSION_PATH = None         # the file this conversation is being saved to
+
+
+def session_dir(root: Path) -> Path:
+    return SESSIONS / hashlib.sha256(str(root).encode()).hexdigest()[:16]
+
+
+def new_session(root: Path) -> Path:
+    # The suffix, because /clear can start a second one within the same second.
+    return session_dir(root) / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}.json"
+
+
+def save_session(messages: list) -> None:
+    """Write the conversation down, 0600 from the first byte, since it holds
+    whatever the agent read.  The system prompt is left out: it is rebuilt on
+    resume, from the rules in force then."""
+    path = SESSION_PATH
+    if path is None or SESSIONS_KEPT <= 0:
+        return
+    if not any(m.get("role") == "user" for m in messages):
+        return
+    doc = {"version": 1, "root": str(ROOTS[0]) if ROOTS else "",
+           "model": MODEL, "messages": messages[1:]}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, default=str)
+        os.replace(tmp, path)
+        old = sorted(path.parent.glob("*.json"), key=_mtime, reverse=True)
+        for stale in old[SESSIONS_KEPT:]:
+            stale.unlink()
+    except OSError as e:
+        warn(f"could not save the session: {e}")
+
+
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def list_sessions(root: Path) -> list:
+    """Saved sessions for this directory, newest first."""
+    return sorted(session_dir(root).glob("*.json"), key=_mtime, reverse=True)
+
+
+def load_session(path: Path) -> list:
+    """The saved messages, or ValueError saying why they cannot be used."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"cannot read {path}: {e}")
+    msgs = doc.get("messages") if isinstance(doc, dict) else None
+    if not isinstance(msgs, list) or not all(
+            isinstance(m, dict) and m.get("role") for m in msgs):
+        raise ValueError(f"{path} is not a saved session")
+    close_dangling(msgs, "The session ended before this call ran.")
+    return msgs
+
+
+def describe_session(path: Path) -> str:
+    """`2h ago  14 turns  fix the failing login test`, for /resume."""
+    try:
+        msgs = load_session(path)
+    except ValueError:
+        return "(unreadable)"
+    asks = [m for m in msgs if m.get("role") == "user"
+            and not str(m.get("content") or "").startswith(SUMMARY_HEAD)]
+    first = str(asks[0].get("content") or "") if asks else ""
+    return f"{_ago(_mtime(path)):>8}  {_n(len(asks), 'turn'):>9}  {_short(first, 70)}"
+
+
+def _ago(t: float) -> str:
+    s = max(0, time.time() - t)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{int(s // n)}{unit} ago"
+    return "just now"
+
+
+def resume(messages: list, path: Path) -> None:
+    """Carry on with a saved conversation, under the system prompt of now."""
+    global SESSION_PATH
+    saved = load_session(path)
+    messages[1:] = saved
+    SESSION_PATH = path
+    asks = [m for m in saved if m.get("role") == "user"]
+    last = str(asks[-1].get("content") or "") if asks else ""
+    print(dim(f"  resumed {path.name}: {_n(len(asks), 'turn')}, last: {_short(last, 80)}"))
+
+
 class Usage:
     def __init__(self):
         self.prompt = self.completion = self.calls = 0
@@ -1738,7 +1840,8 @@ HELP = """  /help            this text
   /cost            tokens used this session
   /retry           send the conversation again after a failed request
   /compact [focus] summarise earlier turns to make room
-  /clear           forget the conversation, keep the rules (alias: /reset)
+  /resume [N]      list saved sessions here, or carry on with one
+  /clear           start a new conversation, keep the rules (alias: /reset)
   /quit            leave"""
 
 
@@ -1760,7 +1863,7 @@ def show_rules(pol) -> None:
 def slash(pol, cmd: str, messages: list, system: str, mine: list,
           max_steps: int = 40) -> bool:
     """Returns False to quit."""
-    global SHOW_THINKING
+    global SHOW_THINKING, SESSION_PATH
     word, _, rest = cmd[1:].partition(" ")
     if word in ("quit", "exit", "q"):
         return False
@@ -1834,11 +1937,36 @@ def slash(pol, cmd: str, messages: list, system: str, mine: list,
         if said.startswith(("restored", "removed")):
             # The model believes its change is still there; tell it otherwise.
             mine.append(f"/undo - {said}")
+    elif word == "resume":
+        found = list_sessions(ROOTS[0]) if ROOTS else []
+        if SESSION_PATH in found:
+            found.remove(SESSION_PATH)      # the one you are in
+        if not found:
+            print("  no other saved sessions for this directory")
+        elif rest.strip().isdigit():
+            n = int(rest)
+            if not 1 <= n <= len(found):
+                print(f"  pick 1 to {len(found)}")
+            else:
+                try:
+                    resume(messages, found[n - 1])
+                except ValueError as e:
+                    print(red(f"  ! {e}"))
+                else:
+                    mine.clear()
+                    TODOS.clear()
+        else:
+            for i, path in enumerate(found[:20], 1):
+                print(f"  {i:2d}  {describe_session(path)}")
+            print(dim("  /resume N carries on with one"))
     elif word in ("reset", "clear"):
         del messages[1:]
         messages[0] = {"role": "system", "content": system}
         mine.clear()          # including anything `!` produced but never sent
         TODOS.clear()
+        if SESSION_PATH is not None and ROOTS:
+            # The old one stays on disk, for /resume.
+            SESSION_PATH = new_session(ROOTS[0])
         print("  conversation cleared")
     else:
         print(f"  unknown command {cmd!r}; try /help")
@@ -1944,7 +2072,8 @@ def main() -> None:
         argv = argv[:i] + rest[2:]
 
     rules_only = "--rules" in argv
-    argv = [a for a in argv if a != "--rules"]
+    carry_on = "-c" in argv or "--continue" in argv
+    argv = [a for a in argv if a not in ("--rules", "-c", "--continue")]
     root = Path(argv[0] if argv and not argv[0].startswith("-") else ".").resolve()
     if not root.is_dir():
         sys.exit(f"{root} is not a directory")
@@ -1966,6 +2095,8 @@ def main() -> None:
                     int(LIMITS.get("max_steps", 40)))
     system = system_prompt(root, pol)
     messages = [{"role": "system", "content": system}]
+    global SESSION_PATH
+    SESSION_PATH = new_session(root)
 
     load_history()
     print(bold(f"miniagent  {tilde(root)}"))
@@ -1975,16 +2106,28 @@ def main() -> None:
     if notes:
         print(dim(f"  notes {', '.join(str(n) for n in notes)}"))
     print(dim("  /help for commands, ctrl-c twice to quit"))
+    if carry_on:
+        found = list_sessions(root)
+        if not found:
+            print(dim("  no saved session here to continue; starting a new one"))
+        else:
+            try:
+                resume(messages, found[0])
+            except ValueError as e:
+                warn(f"{e}; starting a new session")
 
     if prompt:
         messages.append({"role": "user", "content": prompt})
         try:
             run_turn(pol, messages, max_steps)
         except ApiError as e:
+            save_session(messages)
             sys.exit(f"{e}")
         except KeyboardInterrupt:
             close_dangling(messages, "STOPPED by the user with ctrl-c.")
+            save_session(messages)
             sys.exit(130)
+        save_session(messages)
         print(dim(f"\n{USAGE}"))
         return
 
@@ -2038,6 +2181,7 @@ def main() -> None:
             if command.startswith("/"):
                 if not slash(pol, command, messages, system, mine, max_steps):
                     return
+                save_session(messages)
                 continue
             # Only now: a paste that starts with `/` is still a message.
             user = expand_pastes(user)
@@ -2047,6 +2191,7 @@ def main() -> None:
                 mine.clear()
             messages.append({"role": "user", "content": user})
             turn(pol, messages, max_steps)
+            save_session(messages)
     finally:
         BAR.remove()
         print(dim(f"\n{USAGE}"))

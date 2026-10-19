@@ -351,6 +351,7 @@ describe() {
         trusted.json) printf 'project rule files you have vouched for' ;;
         miniagent.md) printf 'standing instructions for every project' ;;
         history)      printf 'what you have typed at the prompt' ;;
+        sessions)     printf 'saved conversations, for agent -c and /resume' ;;
         *)            printf '' ;;
     esac
 }

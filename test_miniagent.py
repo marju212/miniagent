@@ -2979,6 +2979,92 @@ class Summarising(unittest.TestCase):
         self.assertEqual(len(REQUESTS), 2)
 
 
+# ---------------------------------------------------------------- sessions
+class Sessions(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        agent.ROOTS[:] = [self.root]
+        self.saved = agent.SESSION_PATH
+        agent.SESSION_PATH = agent.new_session(self.root)
+
+    def tearDown(self):
+        agent.SESSION_PATH = self.saved
+
+    def msgs(self, text="fix the login"):
+        return [{"role": "system", "content": "old system"},
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": "done",
+                 "reasoning_details": [{"type": "reasoning.text", "text": "r"}]}]
+
+    def test_saved_privately_and_read_back(self):
+        agent.save_session(self.msgs())
+        path = agent.SESSION_PATH
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        back = [{"role": "system", "content": "new system"}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.resume(back, path)
+        self.assertEqual(back[0]["content"], "new system")   # rebuilt, not restored
+        self.assertEqual(back[1:], self.msgs()[1:])
+
+    def test_an_empty_conversation_is_not_saved(self):
+        agent.save_session([{"role": "system", "content": "s"}])
+        self.assertFalse(agent.SESSION_PATH.exists())
+
+    def test_old_sessions_are_pruned(self):
+        with _patch(agent, "SESSIONS_KEPT", 2):
+            for i in range(4):
+                agent.SESSION_PATH = agent.session_dir(self.root) / f"{i}.json"
+                agent.save_session(self.msgs(str(i)))
+                os.utime(agent.SESSION_PATH, (i + 1, i + 1))
+        self.assertEqual([p.name for p in agent.list_sessions(self.root)],
+                         ["3.json", "2.json"])
+
+    def test_a_dangling_tool_call_is_closed_on_load(self):
+        m = self.msgs()
+        m.append({"role": "assistant", "tool_calls": [{"id": "c9", "type": "function",
+                  "function": {"name": "bash", "arguments": "{}"}}]})
+        agent.save_session(m)
+        got = agent.load_session(agent.SESSION_PATH)
+        self.assertEqual(got[-1]["tool_call_id"], "c9")
+
+    def test_slash_resume_lists_then_loads(self):
+        first = agent.SESSION_PATH
+        agent.save_session(self.msgs("the old task"))
+        agent.SESSION_PATH = agent.new_session(self.root).with_name("later.json")
+        messages = [{"role": "system", "content": "s"}]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.slash(make_policy(), "/resume", messages, "s", [])
+        self.assertIn("the old task", out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.slash(make_policy(), "/resume 1", messages, "s", [])
+        self.assertEqual(messages[1]["content"], "the old task")
+        self.assertEqual(agent.SESSION_PATH, first)
+
+    def test_clear_starts_a_new_file(self):
+        agent.save_session(self.msgs())
+        first = agent.SESSION_PATH
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.slash(make_policy(), "/clear", self.msgs(), "s", [])
+        self.assertNotEqual(agent.SESSION_PATH, first)
+        self.assertTrue(first.exists())
+
+    def test_continue_from_the_command_line(self):
+        env = {**os.environ, "AGENT_STREAM": "0"}
+        RESPONSES.append({"role": "assistant", "content": "first answer"})
+        subprocess.run([sys.executable, str(HERE / "agent.py"), "-p", "remember 42",
+                        str(self.root)], env=env, capture_output=True, text=True,
+                       timeout=60)
+        REQUESTS.clear()
+        RESPONSES.append({"role": "assistant", "content": "it was 42"})
+        r = subprocess.run([sys.executable, str(HERE / "agent.py"), "-c", "-p",
+                            "what was it", str(self.root)], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertIn("resumed", r.stdout)
+        sent = [m.get("content") for m in REQUESTS[-1]["messages"]]
+        self.assertIn("remember 42", sent)
+        self.assertIn("first answer", sent)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
