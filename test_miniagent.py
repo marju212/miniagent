@@ -2844,6 +2844,8 @@ class Profiles(unittest.TestCase):
                             ("qwen3.8-27b-instruct-q4", "Qwen3.8"),
                             ("Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen3-Coder"),
                             ("qwen3-coder-plus", "Qwen3-Coder"),
+                            ("zai-org/GLM-5.3-Flash", "GLM-5.3-Flash"),
+                            ("glm-5.3-flashx", "GLM-5.3-Flash"),
                             ("llama-3.3-70b", "default")):
             self.assertEqual(agent.profile_for(model)[0], want, model)
 
@@ -2852,6 +2854,13 @@ class Profiles(unittest.TestCase):
         self.assertEqual((s["temperature"], s["top_p"], s["top_k"],
                           s["repetition_penalty"], s["max_tokens"]),
                          (0.7, 0.8, 20, 1.05, 65536))
+
+    def test_glm_flash_sends_no_top_k(self):
+        out, sent = self.run_banner({"AGENT_MODEL": "glm-5.3-flash"})
+        self.assertIn("tuned GLM-5.3-Flash", out)
+        self.assertEqual((sent["temperature"], sent["top_p"], sent["max_tokens"]),
+                         (1.0, 1.0, 65536))
+        self.assertNotIn("top_k", sent)
 
     def test_an_unknown_model_falls_back_to_minimax(self):
         self.assertEqual(agent.profile_for("gpt-x")[1], agent.profile_for("minimax")[1])

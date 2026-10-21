@@ -1,8 +1,8 @@
 # miniagent
 
 A Claude Code-shaped coding agent, tuned for **MiniMax-M2.5**, with the
-published settings for **Qwen3.8** and **Qwen3-Coder** picked by model name.
-Python 3.9+, standard library only, no dependencies.
+published settings for **Qwen3.8**, **Qwen3-Coder** and **GLM-5.3-Flash** picked by
+model name. Python 3.9+, standard library only, no dependencies.
 
 Everything the agent may do comes out of a JSON rule file — the global one is
 `~/.miniagent/policy.json`. Nothing is baked into the loop: every tool call is
@@ -185,11 +185,12 @@ measured it at — and the banner says which one, and what it sends:
 |---|---|---|---|---|
 | `qwen3-coder` | 0.7 / 0.8 / 20 | repetition_penalty 1.05; no thinking mode | 65536 | 470000 |
 | `qwen3.8` | 1.0 / 0.95 / 20 | thinking mode, reasoning handed back every turn | 32768 | 550000 |
+| `glm-5.3-flash` | 1.0 / 1.0 / none | always thinks, reasoning handed back every turn | 65536 | 2240000 |
 | `minimax`, or anything else | 1.0 / 0.95 / 40 | `reasoning_split` | 16384 | 480000 |
 
 The name is matched case-insensitively, so `Qwen/Qwen3-Coder-30B-A3B-Instruct`
 and `qwen3-coder-plus` are both Qwen3-Coder. `context_chars` is the model's
-262k- or 200k-token window less room for the reply, at about 2.4 characters a
+1M-, 262k- or 200k-token window less room for the reply, at about 2.4 characters a
 token.
 
 Any of them can be overridden: whatever `AGENT_TEMPERATURE`, `AGENT_TOP_P`,

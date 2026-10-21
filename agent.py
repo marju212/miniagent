@@ -102,6 +102,13 @@ PROFILES = (
     ("Qwen3.8", ("qwen3.8",), {
         "temperature": 1.0, "top_p": 0.95, "top_k": 20,
         "max_tokens": 32768, "context_chars": 550_000}),
+    # Thinks always, and keeps its reasoning across turns by default
+    # (clear_thinking false), which the agent does by handing it back.  The
+    # settings Z.ai ran Terminal-Bench with, the closest of theirs to coding
+    # at a shell: top_p 1, 65,536 out; no top_k published.  1M window.
+    ("GLM-5.3-Flash", ("glm-5.3-flash",), {
+        "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+        "max_tokens": 65536, "context_chars": 2_240_000}),
     ("MiniMax", ("minimax",), {
         "temperature": 1.0, "top_p": 0.95, "top_k": 40,
         "max_tokens": 16384, "context_chars": 480_000}),
