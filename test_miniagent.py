@@ -2842,6 +2842,7 @@ class Profiles(unittest.TestCase):
         for model, want in (("MiniMax-M2.5", "MiniMax"),
                             ("Qwen/Qwen3.8-27B", "Qwen3.8"),
                             ("qwen3.8-27b-instruct-q4", "Qwen3.8"),
+                            ("qwen38-27b", "Qwen3.8"),
                             ("Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen3-Coder"),
                             ("qwen3-coder-plus", "Qwen3-Coder"),
                             ("zai-org/GLM-5.3-Flash", "GLM-5.3-Flash"),

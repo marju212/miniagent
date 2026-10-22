@@ -184,7 +184,7 @@ measured it at — and the banner says which one, and what it sends:
 | model name contains | temperature / top_p / top_k | other | max_tokens | context_chars |
 |---|---|---|---|---|
 | `qwen3-coder` | 0.7 / 0.8 / 20 | repetition_penalty 1.05; no thinking mode | 65536 | 470000 |
-| `qwen3.8`, e.g. `Qwen3.8-27B` | 1.0 / 0.95 / 20 | thinking mode, reasoning handed back every turn | 32768 | 550000 |
+| `qwen3.8` or `qwen38`, e.g. `Qwen3.8-27B` | 1.0 / 0.95 / 20 | thinking mode, reasoning handed back every turn | 32768 | 550000 |
 | `glm-5.3-flash` | 1.0 / 1.0 / none | always thinks, reasoning handed back every turn | 65536 | 2240000 |
 | `minimax`, or anything else | 1.0 / 0.95 / 40 | `reasoning_split` | 16384 | 480000 |
 

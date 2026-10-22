@@ -98,8 +98,9 @@ PROFILES = (
         "max_tokens": 65536, "context_chars": 470_000}),
     # Thinking mode, which is what the agent runs it in: its reasoning is
     # handed back every turn, as Qwen's preserve_thinking expects.  32,768 is
-    # what Qwen ran SWE-bench with, out of a 262,144 window.
-    ("Qwen3.8", ("qwen3.8",), {
+    # what Qwen ran SWE-bench with, out of a 262,144 window.  Some servers
+    # drop the dot: qwen38-27b.
+    ("Qwen3.8", ("qwen3.8", "qwen38"), {
         "temperature": 1.0, "top_p": 0.95, "top_k": 20,
         "max_tokens": 32768, "context_chars": 550_000}),
     # Thinks always, and keeps its reasoning across turns by default
